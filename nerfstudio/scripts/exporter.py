@@ -31,11 +31,12 @@ import open3d as o3d
 import torch
 import tyro
 from typing_extensions import Annotated, Literal
+from tqdm import tqdm
 
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManager
-from nerfstudio.data.scene_box import OrientedBox
+from nerfstudio.data.scene_box import OrientedBox, SceneBox
 from nerfstudio.exporter import texture_utils, tsdf_utils
 from nerfstudio.exporter.exporter_utils import collect_camera_poses, generate_point_cloud, get_mesh_from_filename
 from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
@@ -55,6 +56,191 @@ class Exporter:
     output_dir: Path
     """Path to the output directory."""
 
+##################################
+################################## Added
+##################################
+def density_to_alpha(density):
+    return np.clip(1.0 - np.exp(-np.exp(density) / 100.0), 0.0, 1.0)
+
+def nerf_matrix_to_ngp(nerf_matrix, scale=0.33, offset=[0.5, 0.5, 0.5]):
+    """
+    Convert a matrix from the NeRF coordinate system to the instant-ngp coordinate system.
+    """
+    ngp_matrix = np.copy(nerf_matrix)
+    ngp_matrix[:, 1:3] *= -1
+    ngp_matrix[:, -1] = ngp_matrix[:, -1] * scale + offset
+
+    # Convert xyz<-yzx
+    tmp = np.copy(ngp_matrix[0, :])
+    ngp_matrix[0, :] = ngp_matrix[1, :]
+    ngp_matrix[1, :] = ngp_matrix[2, :]
+    ngp_matrix[2, :] = tmp
+
+    return ngp_matrix
+
+def collect_view_dirs(frames):
+        """
+        Get view directions from each frame's transform matrices
+        """
+        # cam_matrices = [np.array(x['transform_matrix']) for x in frames]
+        # ngp_cams = [nerf_matrix_to_ngp(cam_matrix[:-1,:]) for cam_matrix in cam_matrices]
+        # view_dirs = [cam[:, :3] @ np.array([0, 0, 1]) for cam in ngp_cams]
+
+        view_dirs = []
+        for x in frames:
+            cam_matrix = np.array(x["transform_matrix"])
+            view_dir = cam_matrix[:3, 2]  # assuming the z-axis is the view direction
+            view_dirs.append(view_dir)
+
+        # poses = np.array(view_dirs).astype(np.float32)
+        # poses[:, :3, 3] *= self.config.scene_scale
+        # return poses
+
+        return view_dirs
+
+def get_ngp_obj_bounding_box(xform, extent):
+    """
+    Get AABB from the OBB of an object in ngp coordinates.
+    Args:
+        xform: 3x4 matrix for rotation, translation
+        extent: 1x3 matrix for length, width, height (xyz) of bbox
+    Returns:
+        min_pt: 1x3 matrix
+        max_pt: 1x3 matrix
+    """
+    corners = np.array([
+        [1, 1, 1],
+        [1, 1, -1],
+        [1, -1, -1],
+        [1, -1, 1],
+        [-1, 1, 1],
+        [-1, 1, -1],
+        [-1, -1, -1],
+        [-1, -1, 1],
+    ], dtype=float).T # 3x8
+
+    corners *= np.expand_dims(extent, 1) * 0.5 #3x8 * 3x1 = 3x8
+    corners = xform[:, :3] @ corners + xform[:, 3, None] #3x3 * 3x8 * 3x1 = 3x8
+
+    return np.min(corners, axis=1), np.max(corners, axis=1)
+
+def get_scene_bounding_box(json_dict, margin=0.1):
+    """
+    Estimates scene bounding box using object bounding boxes
+    Returns:
+        min_pt: 1x3 matrix
+        max_pt: 1x3 matrix
+        ngp_min_pt: 1x3 matrix
+        ngp_max_pt: 1x3 matrix
+    """
+    min_pt = []
+    max_pt = []
+
+    # Get min & max corners for each bbox:
+    for obj in json_dict['bounding_boxes']:
+        extent = np.array(obj['extents'])
+        orientation = np.array(obj['orientation'])
+        position = np.array(obj['position'])
+
+        xform = np.hstack([orientation, np.expand_dims(position, 1)]) # 3x4 transformation matrix
+        min_pt_, max_pt_ = get_ngp_obj_bounding_box(xform, extent)
+        
+        min_pt.append(min_pt_)
+        max_pt.append(max_pt_)
+
+    min_pt = np.array(min_pt) 
+    max_pt = np.array(max_pt)
+    min_pt = np.min(min_pt, axis=0) # 1x3
+    max_pt = np.max(max_pt, axis=0) # 1x3
+
+    # Slightly enlarge scene bbox
+    enlarging_amt = (max_pt - min_pt) * margin
+    min_pt -= enlarging_amt
+    max_pt += enlarging_amt
+
+    # Get min/max corners in ngp format
+    xform = np.hstack([np.eye(3, 3), np.expand_dims(min_pt, 1)]) # 3x4
+    ngp_min_pt = nerf_matrix_to_ngp(xform)[:, 3] # 1x3
+    xform = np.hstack([np.eye(3, 3), np.expand_dims(max_pt, 1)])  # 3x4
+    ngp_max_pt = nerf_matrix_to_ngp(xform)[:, 3] # 1x3
+
+    min_pt = torch.tensor(min_pt)
+    max_pt = torch.tensor(max_pt)
+
+    CONSOLE.print(f"[bold green]Scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}") 
+
+    return min_pt, max_pt, ngp_min_pt, ngp_max_pt
+
+
+def query_splatfacto_model(model: SplatfactoModel, pipeline, json_path, 
+                           output_path, dataset_type='hypersim', max_res=256):
+    """
+    Extract rgbsigma from a given pre-trained scene
+    """
+    device = model.device
+    db_outs = pipeline.datamanager.train_dataparser_outputs
+
+    with open(json_path) as f:
+        json_dict = json.load(f)
+        if "bounding_boxes" in json_dict and len(json_dict['bounding_boxes']) > 0:
+            bounding_boxes = json_dict["bounding_boxes"]
+        else:
+            CONSOLE.print("[bold yellow]Bounding boxes from transforms.json not found. Exiting.")
+            sys.exit(1)
+
+    ### Get scene bbox:
+    if dataset_type == 'hypersim':
+        ori_min_pt, ori_max_pt, ngp_min_pt, ngp_max_pt = get_scene_bounding_box(json_dict)
+        scene_bbox = db_outs.scene_box
+        CONSOLE.print(f"[bold green]Scene_bbox: \n{scene_bbox}")
+    else:
+        CONSOLE.print(f"[bold yellow]Unknown dataset type: {dataset_type}. Exiting.")
+        sys.exit(1) 
+
+    ### Cameras/View directions
+    cams = db_outs.cameras
+    # CONSOLE.print(f"[bold green]cameras.camera_to_worlds size: \n{cams.camera_to_worlds.size()}")
+    # view_dirs = collect_view_dirs(json_dict["frames"])
+
+    ### Create feature grid
+    res = (ori_max_pt - ori_min_pt) / (ori_max_pt - ori_min_pt).max() * max_res
+    res = res.round().int().tolist()
+    res_x, res_y, res_z = res
+    CONSOLE.print(f"[bold green]Resolution of grid: {res}")
+
+    x = torch.linspace(ori_min_pt[0], ori_max_pt[0], res_x)
+    y = torch.linspace(ori_min_pt[1], ori_max_pt[1], res_y)
+    z = torch.linspace(ori_min_pt[2], ori_max_pt[2], res_z)
+
+    z, y, x = torch.meshgrid(z, y, x)   # consistent with current data format
+    xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).unsqueeze(0).to(device)
+    rgb_mean = torch.zeros((res_x * res_y * res_z, 3)).to(device)
+
+    # TODO: Input feature grid and obtain rgb and density for each position
+
+    ### Extract RGB and Density
+    CONSOLE.print(f"[bold blue]Extracting Splatfacto with resolution: {res}")
+    for cam_idx in tqdm(range(cams.size)):
+        out_dict = model.get_outputs_for_camera(cams[cam_idx:cam_idx+1])
+        rgb = out_dict['rgb']
+        sigma = out_dict['depth']
+
+        CONSOLE.print(f"[bold green]rgb: \n{rgb.size()}")
+        CONSOLE.print(f"[bold green]depth: \n{sigma.size()}")
+
+        exit()
+    exit()
+
+    rgb_mean = rgb_mean / len(range(cams.size))
+    rgbsigma = torch.cat([rgb_mean, sigma.unsqueeze(1)], dim=1)
+
+    np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
+                        bbox_min=ori_min_pt, bbox_max=ori_max_pt,
+                        scale=0.3333, offset=0.0)
+
+##################################
+################################## End of Added
+##################################
 
 def validate_pipeline(normal_method: str, normal_output_name: str, pipeline: Pipeline) -> None:
     """Check that the pipeline is valid for this exporter.
@@ -546,6 +732,57 @@ class ExportGaussianSplat(Exporter):
         o3d.t.io.write_point_cloud(str(filename), pcd)
 
 
+###########################
+########################### ADDED
+###########################
+
+@dataclass
+class ExportSplatfactoRGBDensity(Exporter):
+    """
+    Export RGB and density values from a SplatfactoModel using camera view directions and bounding boxes.
+    Note: Only queries points within the given bounding boxes
+    """
+    scene_name: str = "ai_001_001"
+    """Name of the pre-trained scene"""
+    dataset_type: Literal["hypersim"] = "hypersim"
+    """Name of the dataset which will be used. Update for future datasets."""
+    dataset_path: str = "hypersim"
+    """The path to the scenes in instant-ngp data format."""
+    transforms_filename: str = "transforms.json"
+    """The name of the transforms file containing camera metadata, camera poses and bounding boxes."""
+    ckpt_name: str = "step-000006999.ckpt"
+    """Name of the snapshot/checkpoint"""
+    max_res: int = 256
+    """The maximum resolution of the output."""
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+            
+        _, pipeline, ckpt_path, _ = eval_setup(self.load_config)
+        assert isinstance(pipeline.model, SplatfactoModel)
+        model: SplatfactoModel = pipeline.model
+
+        scene_dir = os.path.join(self.dataset_path, self.scene_name, 'train')
+        if 'transforms.json' not in os.listdir(scene_dir):
+            CONSOLE.print(f"[bold yellow]transforms.json not found for {self.scene_name}. Exiting.")
+            sys.exit(1) 
+
+        json_path = os.path.join(scene_dir, self.transforms_filename)
+        out_path = os.path.join(self.output_dir, f'{self.scene_name}.npz')
+    
+        query_splatfacto_model(
+            model, pipeline, json_path, out_path, 
+            self.dataset_type, self.max_res
+        )
+
+        CONSOLE.print(f"[bold green]:white_check_mark: Done extracting scene: {self.scene_name}")
+
+###########################
+########################### END of ADDED
+###########################
+
+
 Commands = tyro.conf.FlagConversionOff[
     Union[
         Annotated[ExportPointCloud, tyro.conf.subcommand(name="pointcloud")],
@@ -554,6 +791,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[ExportMarchingCubesMesh, tyro.conf.subcommand(name="marching-cubes")],
         Annotated[ExportCameraPoses, tyro.conf.subcommand(name="cameras")],
         Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussian-splat")],
+        Annotated[ExportSplatfactoRGBDensity, tyro.conf.subcommand(name="splatfacto-rgbd")], # Added
     ]
 ]
 
@@ -571,3 +809,4 @@ if __name__ == "__main__":
 def get_parser_fn():
     """Get the parser function for the sphinx docs."""
     return tyro.extras.get_parser(Commands)  # noqa
+
