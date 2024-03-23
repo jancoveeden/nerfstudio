@@ -57,7 +57,7 @@ class Exporter:
     """Path to the output directory."""
 
 ##################################
-################################## Added
+################################## BEGIN of ADDED
 ##################################
 def density_to_alpha(density):
     return np.clip(1.0 - np.exp(-np.exp(density) / 100.0), 0.0, 1.0)
@@ -167,15 +167,16 @@ def get_scene_bounding_box(json_dict, margin=0.1):
     min_pt = torch.tensor(min_pt)
     max_pt = torch.tensor(max_pt)
 
-    CONSOLE.print(f"[bold green]Scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}") 
+    CONSOLE.print(f"[bold green]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}") 
 
     return min_pt, max_pt, ngp_min_pt, ngp_max_pt
 
 
 def query_splatfacto_model(model: SplatfactoModel, pipeline, json_path, 
-                           output_path, dataset_type='hypersim', max_res=256):
+                           output_path, dataset_type='hypersim', max_res=256,
+                           crop_bbox=True):
     """
-    Extract rgbsigma from a given pre-trained scene
+    Extract rgbsigma from a given pre-trained GS scene
     """
     device = model.device
     db_outs = pipeline.datamanager.train_dataparser_outputs
@@ -185,57 +186,63 @@ def query_splatfacto_model(model: SplatfactoModel, pipeline, json_path,
         if "bounding_boxes" in json_dict and len(json_dict['bounding_boxes']) > 0:
             bounding_boxes = json_dict["bounding_boxes"]
         else:
-            CONSOLE.print("[bold yellow]Bounding boxes from transforms.json not found. Exiting.")
+            CONSOLE.print("[bold yellow]Bounding boxes in transforms.json not found. Exiting.")
             sys.exit(1)
 
-    ### Get scene bbox:
+    ### Get scene bbox and crop scene bbox:
     if dataset_type == 'hypersim':
-        ori_min_pt, ori_max_pt, ngp_min_pt, ngp_max_pt = get_scene_bounding_box(json_dict)
+        min_pt, max_pt, ngp_min_pt, ngp_max_pt = get_scene_bounding_box(json_dict)
         scene_bbox = db_outs.scene_box
-        CONSOLE.print(f"[bold green]Scene_bbox: \n{scene_bbox}")
+        min_pt = scene_bbox.aabb[0] # minimum (x,y,z) point
+        max_pt = scene_bbox.aabb[1] # maximum (x,y,z) point
+        CONSOLE.print(f"[bold green]Scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
     else:
         CONSOLE.print(f"[bold yellow]Unknown dataset type: {dataset_type}. Exiting.")
         sys.exit(1) 
 
+    if crop_bbox:
+        obb_pos = (0.0, 0.0, 0.0)
+        obb_rpy = (0.0, 0.0, 0.0)
+        obb_scale = (2.0, 2.0, 2.0)
+        crop_obb = OrientedBox.from_params(obb_pos, obb_rpy, obb_scale)
+
     ### Cameras/View directions
     cams = db_outs.cameras
-    # CONSOLE.print(f"[bold green]cameras.camera_to_worlds size: \n{cams.camera_to_worlds.size()}")
     # view_dirs = collect_view_dirs(json_dict["frames"])
 
     ### Create feature grid
-    res = (ori_max_pt - ori_min_pt) / (ori_max_pt - ori_min_pt).max() * max_res
+    res = (max_pt - min_pt) / (max_pt - min_pt).max() * max_res
     res = res.round().int().tolist()
     res_x, res_y, res_z = res
-    CONSOLE.print(f"[bold green]Resolution of grid: {res}")
 
-    x = torch.linspace(ori_min_pt[0], ori_max_pt[0], res_x)
-    y = torch.linspace(ori_min_pt[1], ori_max_pt[1], res_y)
-    z = torch.linspace(ori_min_pt[2], ori_max_pt[2], res_z)
+    x = torch.linspace(min_pt[0], max_pt[0], res_x)
+    y = torch.linspace(min_pt[1], max_pt[1], res_y)
+    z = torch.linspace(min_pt[2], max_pt[2], res_z)
 
-    z, y, x = torch.meshgrid(z, y, x)   # consistent with current data format
-    xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).unsqueeze(0).to(device)
-    rgb_mean = torch.zeros((res_x * res_y * res_z, 3)).to(device)
+    z, y, x = torch.meshgrid(z, y, x) # e.g. x size: [256, 256, 256]  
+    xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).unsqueeze(0).to(device) # e.g. size: [1, 16777216, 3]
 
-    # TODO: Input feature grid and obtain rgb and density for each position
-
-    ### Extract RGB and Density
+    rgb_mean = torch.zeros((res_x * res_y * res_z, 3)).to(device) # e.g. size: [16777216, 3]
+    #sigmas = torch.zeros((xyz.shape[1], 1), device=device)
+ 
+    ### Extract RGB and Density into the feature grid
     CONSOLE.print(f"[bold blue]Extracting Splatfacto with resolution: {res}")
     for cam_idx in tqdm(range(cams.size)):
-        out_dict = model.get_outputs_for_camera(cams[cam_idx:cam_idx+1])
-        rgb = out_dict['rgb']
-        sigma = out_dict['depth']
+        # out_dict = model.get_outputs_for_camera(cams[cam_idx:cam_idx+1], crop_obb)
+        # rgb = out_dict['rgb']
+        # sigma = out_dict['depth']
+        # CONSOLE.print(f"[bold green]rgb image: \n{rgb.size()}")
+        # CONSOLE.print(f"[bold green]depth image: \n{sigma.size()}")
 
-        CONSOLE.print(f"[bold green]rgb: \n{rgb.size()}")
-        CONSOLE.print(f"[bold green]depth: \n{sigma.size()}")
-
-        exit()
-    exit()
+        rgbs, depths = model.get_rgbsigma(xyz, cams[cam_idx:cam_idx+1], res)
+        rgb_mean += rgbs.squeeze(0)
+        sigma = depths.squeeze()
 
     rgb_mean = rgb_mean / len(range(cams.size))
     rgbsigma = torch.cat([rgb_mean, sigma.unsqueeze(1)], dim=1)
 
     np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
-                        bbox_min=ori_min_pt, bbox_max=ori_max_pt,
+                        bbox_min=min_pt, bbox_max=max_pt,
                         scale=0.3333, offset=0.0)
 
 ##################################
@@ -733,14 +740,14 @@ class ExportGaussianSplat(Exporter):
 
 
 ###########################
-########################### ADDED
+########################### BEGIN of ADDED
 ###########################
 
 @dataclass
 class ExportSplatfactoRGBDensity(Exporter):
     """
-    Export RGB and density values from a SplatfactoModel using camera view directions and bounding boxes.
-    Note: Only queries points within the given bounding boxes
+    Export RGB and density values from a SplatfactoModel using camera view directions and spatial locations.
+    Note: Only queries points within the scene bounding box
     """
     scene_name: str = "ai_001_001"
     """Name of the pre-trained scene"""
@@ -754,6 +761,8 @@ class ExportSplatfactoRGBDensity(Exporter):
     """Name of the snapshot/checkpoint"""
     max_res: int = 256
     """The maximum resolution of the output."""
+    crop_bbox: bool = True
+    """Whether to crop the scene bounding box or not."""
 
     def main(self) -> None:
         if not self.output_dir.exists():
@@ -773,7 +782,7 @@ class ExportSplatfactoRGBDensity(Exporter):
     
         query_splatfacto_model(
             model, pipeline, json_path, out_path, 
-            self.dataset_type, self.max_res
+            self.dataset_type, self.max_res, self.crop_bbox
         )
 
         CONSOLE.print(f"[bold green]:white_check_mark: Done extracting scene: {self.scene_name}")
