@@ -43,10 +43,13 @@ from nerfstudio.exporter.exporter_utils import collect_camera_poses, generate_po
 from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
 from nerfstudio.fields.sdf_field import SDFField  # noqa
 from nerfstudio.models.splatfacto import SplatfactoModel
+from nerfstudio.models.nerfacto import NerfactoModel
 from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 
+import accelerate
+from zipnerf_pytorch.zipnerf_ns.zipnerf_model import ZipNerfModel
 
 @dataclass
 class Exporter:
@@ -173,12 +176,16 @@ def get_scene_bounding_box(json_dict, margin=0.1):
     return min_pt, max_pt, ngp_min_pt, ngp_max_pt
 
 
-def query_splatfacto_model(model: SplatfactoModel, pipeline, json_path, 
-                           output_path, dataset_type='hypersim', max_res=256,
-                           crop_bbox=True):
+def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, 
+                    dataset_type='hypersim', max_res=256, 
+                    crop_bbox=True):
     """
-    Extract rgbsigma from a given pre-trained GS scene
+    Extract rgbsigma from a given pre-trained NeRF scene
     """
+    if (nerf_name == "zipnerf"):
+        accelerator = accelerate.Accelerator()
+
+    # device = accelerator.device
     device = model.device
     db_outs = pipeline.datamanager.train_dataparser_outputs
 
@@ -224,10 +231,10 @@ def query_splatfacto_model(model: SplatfactoModel, pipeline, json_path,
     xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).unsqueeze(0).to(device) # e.g. size: [1, 16777216, 3]
 
     rgb_mean = torch.zeros((res_x * res_y * res_z, 3)).to(device) # e.g. size: [16777216, 3]
-    #sigmas = torch.zeros((xyz.shape[1], 1), device=device)
+    #viewdirs = torch.Tensor(poses[:, :3, :3] @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(1).repeat(1, xyz.shape[1], 1)
  
     ### Extract RGB and Density into the feature grid
-    CONSOLE.print(f"[bold blue]Extracting Splatfacto with resolution: {res}")
+    CONSOLE.print(f"[bold blue]Extracting {nerf_name} with resolution: {res}")
     for cam_idx in tqdm(range(cams.size)):
         # out_dict = model.get_outputs_for_camera(cams[cam_idx:cam_idx+1], crop_obb)
         # rgb = out_dict['rgb']
@@ -235,12 +242,16 @@ def query_splatfacto_model(model: SplatfactoModel, pipeline, json_path,
         # CONSOLE.print(f"[bold green]rgb image: \n{rgb.size()}")
         # CONSOLE.print(f"[bold green]depth image: \n{sigma.size()}")
 
-        rgbs, depths = model.get_rgbsigma(xyz, cams[cam_idx:cam_idx+1], res)
-        rgb_mean += rgbs.squeeze(0)
-        sigma = depths.squeeze()
+        # rgbs, depths = model.get_rgbsigma(xyz, cams[cam_idx:cam_idx+1], res)
+        # rgb_mean += rgbs.squeeze(0)
+        # sigma = depths.squeeze()
+
+        rgb = model.evaluate_color(model, accelerator, xyz, viewdirs, config)
+        density = model.evaluate_density(model, accelerator, xyz, viewdirs, config)
+        rgb_mean += rgb.squeeze(0)
 
     rgb_mean = rgb_mean / len(range(cams.size))
-    rgbsigma = torch.cat([rgb_mean, sigma.unsqueeze(1)], dim=1)
+    rgbsigma = torch.cat([rgb_mean, density.unsqueeze(1)], dim=1)
 
     np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
                         bbox_min=min_pt, bbox_max=max_pt,
@@ -794,11 +805,13 @@ class ExportGaussianSplat(Exporter):
 ###########################
 
 @dataclass
-class ExportSplatfactoRGBDensity(Exporter):
+class ExportNeRFRGBDensity(Exporter):
     """
-    Export RGB and density values from a SplatfactoModel using camera view directions and spatial locations.
-    Note: Only queries points within the scene bounding box
+    Export RGB and density values from a NeRF model using camera view directions and spatial locations.
+    Note: Only queries points within the scene bounding box.
     """
+    nerf_model: Literal["splatfacto", "nerfacto", "zipnerf"] = "splatfacto"
+    """Name of NeRF model utilized"""
     scene_name: str = "ai_001_001"
     """Name of the pre-trained scene"""
     dataset_type: Literal["hypersim"] = "hypersim"
@@ -819,23 +832,36 @@ class ExportSplatfactoRGBDensity(Exporter):
             self.output_dir.mkdir(parents=True)
             
         _, pipeline, ckpt_path, _ = eval_setup(self.load_config)
-        assert isinstance(pipeline.model, SplatfactoModel)
-        model: SplatfactoModel = pipeline.model
 
         scene_dir = os.path.join(self.dataset_path, self.scene_name, 'train')
         if 'transforms.json' not in os.listdir(scene_dir):
             CONSOLE.print(f"[bold yellow]transforms.json not found for {self.scene_name}. Exiting.")
-            sys.exit(1) 
-
+            sys.exit(1)
+            
         json_path = os.path.join(scene_dir, self.transforms_filename)
         out_path = os.path.join(self.output_dir, f'{self.scene_name}.npz')
-    
-        query_splatfacto_model(
-            model, pipeline, json_path, out_path, 
+
+        if (self.nerf_model == "splatfacto"):
+            assert isinstance(pipeline.model, SplatfactoModel)
+            model: SplatfactoModel = pipeline.model
+
+        elif (self.nerf_model == "nerfacto"):
+            assert isinstance(pipeline.model, NerfactoModel)
+            model: NerfactoModel = pipeline.model
+        elif (self.nerf_model == "zipnerf"):
+            assert isinstance(pipeline.model, ZipNerfModel)
+            model: ZipNerfModel = pipeline.model
+        else:
+            CONSOLE.print(f"[bold yellow]Invalid NeRF model: {self.nerf_model}. Exiting.")
+            sys.exit(1)
+
+        query_nerf_model(
+            self.nerf_model, model, pipeline, json_path, out_path, 
             self.dataset_type, self.max_res, self.crop_bbox
         )
 
         CONSOLE.print(f"[bold green]:white_check_mark: Done extracting scene: {self.scene_name}")
+
 
 ###########################
 ########################### END of ADDED
@@ -850,7 +876,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[ExportMarchingCubesMesh, tyro.conf.subcommand(name="marching-cubes")],
         Annotated[ExportCameraPoses, tyro.conf.subcommand(name="cameras")],
         Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussian-splat")],
-        Annotated[ExportSplatfactoRGBDensity, tyro.conf.subcommand(name="splatfacto-rgbd")], # Added
+        Annotated[ExportNeRFRGBDensity, tyro.conf.subcommand(name="nerf-rgbd")], # Added
     ]
 ]
 
