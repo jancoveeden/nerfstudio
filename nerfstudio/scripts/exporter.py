@@ -51,7 +51,10 @@ from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 
 import accelerate
-from zipnerf_pytorch.zipnerf_ns.zipnerf_model import ZipNerfModel
+from zipnerf_ns.zipnerf_model import ZipNerfModel 
+
+sys.path.append(r"C:\Users\OEM\nerf-gs-detect\nerfstudio\zipnerf-pytorch") 
+from extract import get_rgbsigma
 
 @dataclass
 class Exporter:
@@ -184,10 +187,6 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
     """
     Extract rgbsigma from a given pre-trained NeRF scene
     """
-    if (nerf_name == "zipnerf"):
-        accelerator = accelerate.Accelerator()
-
-    # device = accelerator.device
     device = model.device
     db_outs = pipeline.datamanager.train_dataparser_outputs
 
@@ -231,29 +230,47 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
 
     z, y, x = torch.meshgrid(z, y, x) # e.g. x size: [256, 256, 256]  
     xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).unsqueeze(0).to(device) # e.g. size: [1, 16777216, 3]
+    #xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).to(device) # e.g. size: [16777216, 3]
+    CONSOLE.print(f"[bold yellow]xyz: {xyz.size()}") 
 
     rgb_mean = torch.zeros((res_x * res_y * res_z, 3)).to(device) # e.g. size: [16777216, 3]
     #viewdirs = torch.Tensor(poses[:, :3, :3] @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(1).repeat(1, xyz.shape[1], 1)
- 
-    ### Extract RGB and Density into the feature grid
+    #viewdir = torch.Tensor(poses[i, :3, :3] @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(0)
+
+    ### Extract RGB and density into the feature grid
     CONSOLE.print(f"[bold blue]Extracting {nerf_name} with resolution: {res}")
-    for cam_idx in tqdm(range(cams.size)):
-        # out_dict = model.get_outputs_for_camera(cams[cam_idx:cam_idx+1], crop_obb)
-        # rgb = out_dict['rgb']
-        # sigma = out_dict['depth']
-        # CONSOLE.print(f"[bold green]rgb image: \n{rgb.size()}")
-        # CONSOLE.print(f"[bold green]depth image: \n{sigma.size()}")
+    for cam_idx in tqdm(range(cams.size), desc="Iterating through cams"):
+        #cam_ray_bundle = cams.generate_rays(camera_indices=cam_idx, disable_distortion=False, obb_box=crop_obb).to(pipeline.device)
+        #CONSOLE.print(f"[bold yellow]ray_bundle.origins: \n{cam_ray_bundle.origins}") 
+        #CONSOLE.print(f"[bold yellow]ray_bundle.directions: \n{cam_ray_bundle.directions}") 
+        # CONSOLE.print(f"[bold yellow]View dir: \n{viewdir}") 
+        # CONSOLE.print(f"[bold yellow]cam_idx: \n{cam_idx}") 
+        # out_dict = model.get_outputs(cam_ray_bundle)
 
-        # rgbs, depths = model.get_rgbsigma(xyz, cams[cam_idx:cam_idx+1], res)
-        # rgb_mean += rgbs.squeeze(0)
-        # sigma = depths.squeeze()
+        # viewdir = torch.Tensor(poses[i, :3, :3] @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(0)
+        viewdir = cams[cam_idx:cam_idx+1].camera_to_worlds
+        #CONSOLE.print(f"[bold yellow]View dir: \n{viewdir.size()}\n{viewdir}") 
 
-        rgb = model.evaluate_color(model, accelerator, xyz, viewdirs, config)
-        density = model.evaluate_density(model, accelerator, xyz, viewdirs, config)
-        rgb_mean += rgb.squeeze(0)
+        #viewdirs = torch.Tensor(torch.Tensor(viewdir[:, :3, :3]).to(device) @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(1).repeat(1, xyz.shape[1], 1)
+        #CONSOLE.print(f"[bold yellow]viewdirs: \n{viewdirs.size()}") 
+
+        viewdirs = torch.Tensor(torch.Tensor(viewdir[cam_idx:cam_idx+1, :3, :3]).to(device) @ torch.Tensor([0, 0, -1]).to(device))
+        CONSOLE.print(f"[bold yellow] viewdirs: {viewdirs.size()}") 
+
+        # rgb, density = get_rgbsigma(model, xyz, viewdirs)
+        # CONSOLE.print(f"[bold yellow]rgb: {rgb.size()}\n{rgb}") 
+        # CONSOLE.print(f"[bold yellow]density: {density.size()}\n{density}") 
+
+        rgb, density = model(xyz, viewdirs)
+
+        # rgbsigma = torch.cat([rgb, density.unsqueeze(1)], dim=1)
+        # rgb_mean += rgb.squeeze(0) # Acummalates (res_z * res_y * res_x, 3)
+        
+        exit()
 
     rgb_mean = rgb_mean / len(range(cams.size))
-    rgbsigma = torch.cat([rgb_mean, density.unsqueeze(1)], dim=1)
+    rgbsigma = torch.cat([rgb_mean, density.unsqueeze(1)], dim=1) # (res_z * res_y * res_x, 4)
+    #rgbsigma = rgbsigma / len(range(cams.size))
 
     np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
                         bbox_min=min_pt, bbox_max=max_pt,
@@ -852,7 +869,6 @@ class ExportNeRFRGBDensity(Exporter):
         if (self.nerf_model == "splatfacto"):
             assert isinstance(pipeline.model, SplatfactoModel)
             model: SplatfactoModel = pipeline.model
-
         elif (self.nerf_model == "nerfacto"):
             assert isinstance(pipeline.model, NerfactoModel)
             model: NerfactoModel = pipeline.model
