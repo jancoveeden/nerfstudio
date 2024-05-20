@@ -51,7 +51,6 @@ from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 
-import accelerate
 from zipnerf_ns.zipnerf_model import ZipNerfModel 
 
 sys.path.append(r"C:\Users\OEM\nerf-gs-detect\nerfstudio\zipnerf-pytorch") 
@@ -191,6 +190,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
     device = model.device
     db_outs = pipeline.datamanager.train_dataparser_outputs
 
+    # Get bounding boxes:
     with open(json_path) as f:
         json_dict = json.load(f)
         if "bounding_boxes" in json_dict and len(json_dict['bounding_boxes']) > 0:
@@ -216,7 +216,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
         obb_scale = (2.0, 2.0, 2.0)
         crop_obb = OrientedBox.from_params(obb_pos, obb_rpy, obb_scale)
 
-    ### Cameras/View directions
+    ### Cameras
     cams = db_outs.cameras
     # view_dirs = collect_view_dirs(json_dict["frames"])
 
@@ -229,50 +229,35 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
     y = torch.linspace(min_pt[1], max_pt[1], res_y)
     z = torch.linspace(min_pt[2], max_pt[2], res_z)
 
-    z, y, x = torch.meshgrid(z, y, x) # e.g. x size: [256, 256, 256]  
+    z, y, x = torch.meshgrid(z, y, x, indexing="xy") # e.g. x size: [256, 256, 256]  
     xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).unsqueeze(0).to(device) # e.g. size: [1, 16777216, 3]
-    #xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).to(device) # e.g. size: [16777216, 3]
-    CONSOLE.print(f"[bold yellow]xyz: {xyz.size()}") 
-
+    # xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).to(device) # e.g. size: [16777216, 3]
     rgb_mean = torch.zeros((res_x * res_y * res_z, 3)).to(device) # e.g. size: [16777216, 3]
-    #viewdirs = torch.Tensor(poses[:, :3, :3] @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(1).repeat(1, xyz.shape[1], 1)
-    #viewdir = torch.Tensor(poses[i, :3, :3] @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(0)
+    # CONSOLE.print(f"[bold yellow]xyz: {xyz.size()}") 
 
     ### Extract RGB and density into the feature grid
     CONSOLE.print(f"[bold blue]Extracting {nerf_name} with resolution: {res}")
-    for cam_idx in tqdm(range(cams.size), desc="Iterating through cams"):
-        #cam_ray_bundle = cams.generate_rays(camera_indices=cam_idx, disable_distortion=False, obb_box=crop_obb).to(pipeline.device)
-        #CONSOLE.print(f"[bold yellow]ray_bundle.origins: \n{cam_ray_bundle.origins}") 
-        #CONSOLE.print(f"[bold yellow]ray_bundle.directions: \n{cam_ray_bundle.directions}") 
-        # CONSOLE.print(f"[bold yellow]View dir: \n{viewdir}") 
-        # CONSOLE.print(f"[bold yellow]cam_idx: \n{cam_idx}") 
-        # out_dict = model.get_outputs(cam_ray_bundle)
+    CONSOLE.print(f"[bold blue]Iterating through {cams.size} cameras...")
+    for cam_idx in tqdm(range(cams.size), desc="Extracting RGB/Sigma"):
 
-        # viewdir = torch.Tensor(poses[i, :3, :3] @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(0)
-        viewdir = cams[cam_idx:cam_idx+1].camera_to_worlds
-        #CONSOLE.print(f"[bold yellow]View dir: \n{viewdir.size()}\n{viewdir}") 
+        trans_mat = cams[cam_idx].camera_to_worlds
+        viewdirs = torch.Tensor(torch.Tensor(trans_mat[:3, :3]).unsqueeze(0).to(device) @ torch.Tensor([0, 0, -1]).to(device))
+        #CONSOLE.print(f"[bold yellow]camera_to_worlds: \n{trans_mat}") 
+        #CONSOLE.print(f"[bold yellow]viewdirs: {viewdirs}")  # (1, 3)
 
-        #viewdirs = torch.Tensor(torch.Tensor(viewdir[:, :3, :3]).to(device) @ torch.Tensor([0, 0, -1]).to(device)).unsqueeze(1).repeat(1, xyz.shape[1], 1)
-        #CONSOLE.print(f"[bold yellow]viewdirs: \n{viewdirs.size()}") 
+        rgb, sigma = get_rgbsigma(model, xyz, viewdirs)
+        #CONSOLE.print(f"[bold yellow]rgb: {rgb.size()}") # (res_z * res_y * res_x, 3)
+        #CONSOLE.print(f"[bold yellow]sigma: {sigma.size()}") # (res_z * res_y * res_x, 1)
 
-        viewdirs = torch.Tensor(torch.Tensor(viewdir[cam_idx:cam_idx+1, :3, :3]).to(device) @ torch.Tensor([0, 0, -1]).to(device))
-        CONSOLE.print(f"[bold yellow] viewdirs: {viewdirs.size()}") 
-
-        # rgb, density = get_rgbsigma(model, xyz, viewdirs)
-        # CONSOLE.print(f"[bold yellow]rgb: {rgb.size()}\n{rgb}") 
-        # CONSOLE.print(f"[bold yellow]density: {density.size()}\n{density}") 
-
-        rgb, density = model(xyz, viewdirs)
-
-        # rgbsigma = torch.cat([rgb, density.unsqueeze(1)], dim=1)
-        # rgb_mean += rgb.squeeze(0) # Acummalates (res_z * res_y * res_x, 3)
-        
-        exit()
+        rgb_mean += rgb # Acummalates (res_z * res_y * res_x, 3)
 
     rgb_mean = rgb_mean / len(range(cams.size))
-    rgbsigma = torch.cat([rgb_mean, density.unsqueeze(1)], dim=1) # (res_z * res_y * res_x, 4)
-    #rgbsigma = rgbsigma / len(range(cams.size))
+    rgbsigma = torch.cat([rgb_mean, sigma], dim=1) # (res_z * res_y * res_x, 4)
 
+    rgbsigma = rgbsigma.cpu().numpy()
+    min_pt = min_pt.cpu().numpy()
+    max_pt = max_pt.cpu().numpy()
+    CONSOLE.print(f"[bold blue]Saving rgbsigma of size: {rgbsigma.shape}")
     np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
                         bbox_min=min_pt, bbox_max=max_pt,
                         scale=0.3333, offset=0.0)
@@ -873,6 +858,8 @@ class ExportNeRFRGBDensity(Exporter):
             self.output_dir.mkdir(parents=True)
             
         _, pipeline, ckpt_path, _ = eval_setup(self.load_config)
+        #self.scene_name =  os.path.basename(c_.pipeline.datamanager.data)
+        self.scene_name = 'ai_002_005'
 
         scene_dir = os.path.join(self.dataset_path, self.scene_name, 'train')
         if 'transforms.json' not in os.listdir(scene_dir):
