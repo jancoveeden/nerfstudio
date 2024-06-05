@@ -51,8 +51,6 @@ from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 
-from zipnerf_ns.zipnerf_model import ZipNerfModel 
-from extract import get_rgbsigma
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from nerfstudio.cameras.rays import RaySamples, Frustums
 from nerfstudio.field_components.field_heads import FieldHeadNames
@@ -325,6 +323,8 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
 
     ### Extract RGB and density into the feature grid
     if (nerf_name == "zipnerf"):
+        from extract import get_rgbsigma
+        
         # Create 3D feature grid
         x = torch.linspace(min_pt[0], max_pt[0], res_x)
         y = torch.linspace(min_pt[1], max_pt[1], res_y)
@@ -1050,6 +1050,7 @@ class ExportNeRFRGBDensity(Exporter):
             assert isinstance(pipeline.model, NerfactoModel)
             model: NerfactoModel = pipeline.model
         elif (self.nerf_model == "zipnerf"):
+            from zipnerf_ns.zipnerf_model import ZipNerfModel 
             sys.path.append(r"C:\Users\OEM\nerf-gs-detect\nerfstudio\zipnerf-pytorch") 
             assert isinstance(pipeline.model, ZipNerfModel)
             model: ZipNerfModel = pipeline.model
