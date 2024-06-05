@@ -52,9 +52,102 @@ from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from zipnerf_ns.zipnerf_model import ZipNerfModel 
-
 sys.path.append(r"C:\Users\OEM\nerf-gs-detect\nerfstudio\zipnerf-pytorch") 
 from extract import get_rgbsigma
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+from nerfstudio.cameras.rays import RaySamples, Frustums
+from nerfstudio.field_components.field_heads import FieldHeadNames
+
+class Grid_Sampler:
+    """Grid sampler to represent a scene as a grid of voxels.
+
+    grid contains 7-channel 3D grid
+        - Red      -> grid[0, :, : ,:]  --|
+        - Green    -> grid[1, :, : ,:]  --|--|-- rgbsigma
+        - Blue     -> grid[2, :, : ,:]  --|--|
+        - Alpha    -> grid[3, :, : ,:]  --|
+        - x_coords -> grid[4, :, : ,:]
+        - y_coords -> grid[5, :, : ,:]
+        - z_coords -> grid[6, :, : ,:]
+
+    Args:
+        grid_limits: Scene box xyz limits as an array (x_min, x_max, y_min, y_max, z_min, z_max)
+        max_res: int: Maximum resolution for x,y,z axis
+        device: Device where the grid must be stored
+    """
+
+    def __init__(self, grid_limits, max_res, device="cpu") -> None:
+        self.grid_limits =  grid_limits
+        self.grid_step = (self.grid_limits[1] - self.grid_limits[0]) / (max_res - 1)
+        self.voxel_grid_step = (self.grid_limits[1] - self.grid_limits[0]) / max_res
+        self.max_res = max_res
+        self.delta = 1e-2
+        self.device = device
+
+        self.grid = torch.zeros(7, int(max_res), int(max_res), int(max_res), dtype=torch.float32, device=device)
+
+    def update_feature_grid(self, rays_xyz, rgb, density):
+        """
+        Adds RGB and density values to an existing 3D feature grid
+
+        Args:
+            rays_xyz: Grid coordinates
+            rgb: Average rgb values for given view directions
+            density: Average density values for given view directions
+        """
+        rays_xyz = rays_xyz.reshape(-1, 3).to(self.device)  # [4096, 3]
+        rgb = rgb.reshape(-1, 3).to(self.device)            # [4096, 3]
+        density = density.reshape(-1, 1).to(self.device)    # [4096, 1]
+    
+        alpha = torch.clip(1 - torch.exp(-self.delta * density), 0, 1)
+        colour = torch.sigmoid(rgb)
+
+        xs = ((rays_xyz[:, 0] - self.grid_limits[0]) / self.grid_step).int() # [4096]
+        ys = ((rays_xyz[:, 1] - self.grid_limits[2]) / self.grid_step).int() # [4096]
+        zs = ((rays_xyz[:, 2] - self.grid_limits[4]) / self.grid_step).int() # [4096]
+        
+        mask = (xs >= 0) & (xs < self.grid.shape[1]) & (ys >= 0) & (ys < self.grid.shape[2]) & (zs >= 0) & (zs < self.grid.shape[3])
+
+        xs = xs[mask]
+        ys = ys[mask]
+        zs = zs[mask]
+        # colour = colour[mask].to(torch.float16)
+        # alpha = alpha[mask].to(torch.float16)
+        colour = colour[mask].float()
+        alpha = alpha[mask].float()
+
+        self.grid[0, xs, ys, zs] = colour[:, 0].squeeze() # [4096]
+        self.grid[1, xs, ys, zs] = colour[:, 1].squeeze() # [4096]
+        self.grid[2, xs, ys, zs] = colour[:, 2].squeeze() # [4096]
+        self.grid[3, xs, ys, zs] = alpha.squeeze()        # [4096]
+    
+    def generate_voxel_coords(self):
+        grid_v_coords = torch.meshgrid(torch.arange(self.grid_limits[0], self.grid_limits[1], self.voxel_grid_step), 
+                                    torch.arange(self.grid_limits[2], self.grid_limits[3], self.voxel_grid_step), 
+                                    torch.arange(self.grid_limits[4], self.grid_limits[5], self.voxel_grid_step), 
+                                    indexing='ij')
+        grid_v_coords = torch.stack(grid_v_coords, dim=0)
+
+        return grid_v_coords
+
+    def generate_coords(self):
+        grid_coords = torch.meshgrid(torch.linspace(self.grid_limits[0], self.grid_limits[1], self.max_res), 
+                                    torch.linspace(self.grid_limits[2], self.grid_limits[3], self.max_res), 
+                                    torch.linspace(self.grid_limits[4], self.grid_limits[5], self.max_res), 
+                                    indexing='ij')
+        grid_coords = torch.stack(grid_coords, dim=0)
+
+        return grid_coords
+
+    def get_nerf_rpn_output(self):
+        """
+        Returns rgbsigma in the NeRF-RPN format
+        Refer to https://github.com/lyclyc52/NeRF_RPN
+        """
+        rgbsigma = self.grid[:4,:,:,:]
+
+        return rgbsigma
+
 
 @dataclass
 class Exporter:
@@ -65,9 +158,6 @@ class Exporter:
     output_dir: Path
     """Path to the output directory."""
 
-##################################
-################################## BEGIN of ADDED
-##################################
 def density_to_alpha(density):
     return np.clip(1.0 - np.exp(-np.exp(density) / 100.0), 0.0, 1.0)
 
@@ -90,6 +180,7 @@ def nerf_matrix_to_ngp(nerf_matrix, scale=0.33, offset=[0.5, 0.5, 0.5]):
 def collect_view_dirs(frames):
         """
         Get view directions from each frame's transform matrices
+        from NeRF-RPN instant-ngp
         """
         # cam_matrices = [np.array(x['transform_matrix']) for x in frames]
         # ngp_cams = [nerf_matrix_to_ngp(cam_matrix[:-1,:]) for cam_matrix in cam_matrices]
@@ -180,12 +271,21 @@ def get_scene_bounding_box(json_dict, margin=0.1):
 
     return min_pt, max_pt, ngp_min_pt, ngp_max_pt
 
-
 def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, 
-                    dataset_type='hypersim', max_res=256, 
-                    crop_bbox=True):
+                    dataset_type='hypersim', max_res=256, crop_bbox=True, 
+                    use_fixed_viewdirs=False, batch_size=4096):
     """
     Extract rgbsigma from a given pre-trained NeRF scene
+
+    Args:
+        nerf_name: Name of NeRF model used for novel view synthesis
+        model: NeRF model object (Splatfacto, Nerfacto or ZipNeRF)
+        pipeline: NeRF model pipeline module
+        json_path: Path to transform.json containing bboxes, transformation matrices etc.
+        output_path: Path to .npz file to save
+        dataset_type: Dataset name (Hypersim)
+        max_res: Maximum resolution for an axis for the feature grid 
+        crop_bbox: Whether to crop the scene bounding box or not.
     """
     device = model.device
     db_outs = pipeline.datamanager.train_dataparser_outputs
@@ -218,53 +318,130 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
 
     ### Cameras
     cams = db_outs.cameras
-    # view_dirs = collect_view_dirs(json_dict["frames"])
 
-    ### Create feature grid
+    ### Get resolution of 3D feature grid
     res = (max_pt - min_pt) / (max_pt - min_pt).max() * max_res
     res = res.round().int().tolist()
     res_x, res_y, res_z = res
 
-    x = torch.linspace(min_pt[0], max_pt[0], res_x)
-    y = torch.linspace(min_pt[1], max_pt[1], res_y)
-    z = torch.linspace(min_pt[2], max_pt[2], res_z)
-
-    z, y, x = torch.meshgrid(z, y, x, indexing="xy") # e.g. x size: [256, 256, 256]  
-    xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).unsqueeze(0).to(device) # e.g. size: [1, 16777216, 3]
-    # xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).to(device) # e.g. size: [16777216, 3]
-    rgb_mean = torch.zeros((res_x * res_y * res_z, 3)).to(device) # e.g. size: [16777216, 3]
-    # CONSOLE.print(f"[bold yellow]xyz: {xyz.size()}") 
-
     ### Extract RGB and density into the feature grid
-    CONSOLE.print(f"[bold blue]Extracting {nerf_name} with resolution: {res}")
-    CONSOLE.print(f"[bold blue]Iterating through {cams.size} cameras...")
-    for cam_idx in tqdm(range(cams.size), desc="Extracting RGB/Sigma"):
+    if (nerf_name == "zipnerf"):
+        # Create 3D feature grid
+        x = torch.linspace(min_pt[0], max_pt[0], res_x)
+        y = torch.linspace(min_pt[1], max_pt[1], res_y)
+        z = torch.linspace(min_pt[2], max_pt[2], res_z)
 
-        trans_mat = cams[cam_idx].camera_to_worlds
-        viewdirs = torch.Tensor(torch.Tensor(trans_mat[:3, :3]).unsqueeze(0).to(device) @ torch.Tensor([0, 0, -1]).to(device))
-        #CONSOLE.print(f"[bold yellow]camera_to_worlds: \n{trans_mat}") 
-        #CONSOLE.print(f"[bold yellow]viewdirs: {viewdirs}")  # (1, 3)
+        z, y, x = torch.meshgrid(z, y, x, indexing="ij") # e.g. x size: [128, 128, 128]  
+        xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).unsqueeze(0).to(device) # e.g. size: [1, 2097152, 3]
+        # xyz = torch.stack([x, y, z], dim=-1).reshape(-1, 3).to(device) # e.g. size: [2097152, 3]
+        rgb_mean = torch.zeros((res_x * res_y * res_z, 3)).to(device) # e.g. size: [2097152, 3]
 
-        rgb, sigma = get_rgbsigma(model, xyz, viewdirs)
-        #CONSOLE.print(f"[bold yellow]rgb: {rgb.size()}") # (res_z * res_y * res_x, 3)
-        #CONSOLE.print(f"[bold yellow]sigma: {sigma.size()}") # (res_z * res_y * res_x, 1)
+        CONSOLE.print(f"[bold blue]Extracting {nerf_name} with resolution: {res}")
+        CONSOLE.print(f"[bold blue]Iterating through {cams.size} cameras...")
+        for cam_idx in tqdm(range(cams.size), desc="Extracting RGB/Sigma"):
 
-        rgb_mean += rgb # Acummalates (res_z * res_y * res_x, 3)
+            trans_mat = cams[cam_idx].camera_to_worlds
+            viewdir = torch.Tensor(torch.Tensor(trans_mat[:3, :3]).unsqueeze(0).to(device) @ torch.Tensor([0, 0, -1]).to(device))
+            #CONSOLE.print(f"[bold yellow]camera_to_worlds: \n{trans_mat}") 
+            #CONSOLE.print(f"[bold yellow]viewdirs: {viewdir}")  # (1, 3)
 
-    rgb_mean = rgb_mean / len(range(cams.size))
-    rgbsigma = torch.cat([rgb_mean, sigma], dim=1) # (res_z * res_y * res_x, 4)
+            rgb, sigma = get_rgbsigma(model, xyz, viewdir, batch_size)
+            #CONSOLE.print(f"[bold yellow]rgb: {rgb.size()}") # (res_z * res_y * res_x, 3)
+            #CONSOLE.print(f"[bold yellow]sigma: {sigma.size()}") # (res_z * res_y * res_x, 1)
 
-    rgbsigma = rgbsigma.cpu().numpy()
-    min_pt = min_pt.cpu().numpy()
-    max_pt = max_pt.cpu().numpy()
-    CONSOLE.print(f"[bold blue]Saving rgbsigma of size: {rgbsigma.shape}")
-    np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
-                        bbox_min=min_pt, bbox_max=max_pt,
-                        scale=0.3333, offset=0.0)
+            # Acummalates (res_z * res_y * res_x, 3)
+            rgb_mean += rgb 
 
-##################################
-################################## End of Added
-##################################
+        rgb_mean = rgb_mean / len(range(cams.size))
+        rgbsigma = torch.cat([rgb_mean, sigma], dim=1) # (res_z * res_y * res_x, 4)
+
+        rgbsigma = rgbsigma.cpu().numpy()
+        min_pt = min_pt.cpu().numpy()
+        max_pt = max_pt.cpu().numpy()
+        CONSOLE.print(f"[bold blue]Saving rgbsigma of size: {rgbsigma.shape}")
+        np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
+                            bbox_min=min_pt, bbox_max=max_pt,
+                            scale=0.3333, offset=0.0)
+        
+    elif (nerf_name == "nerfacto"):
+        grid_limits = np.array([min_pt[0],max_pt[0],min_pt[1],max_pt[1],min_pt[2],max_pt[2]])
+        grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu")
+        grid_coords = grid_sampler.generate_coords()
+        grid_sampler.grid[4:,:,:,:] = grid_coords
+        coords_to_render = grid_coords.view(-1, 3)
+
+        vision_field = model.field
+        spatial_distort = vision_field.spatial_distortion
+        vision_field.spatial_distortion = None
+
+        aabb_lengths = max_pt[1] - min_pt[0] 
+
+        CONSOLE.print(f"[bold blue]grid size: {grid_sampler.grid.size()}") # [7, 128, 128, 128]
+        CONSOLE.print(f"[bold blue]coords_to_render size: {coords_to_render.size()}") # [2097152, 3]
+
+        with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TimeElapsedColumn(),
+                    MofNCompleteColumn(),
+                    transient=True,
+        ) as progress:
+            task = progress.add_task("[green]Extracting feature grid...", total=coords_to_render.shape[0])
+            for i in range(0, coords_to_render.shape[0], batch_size):
+                if i + batch_size > coords_to_render.shape[0]:
+                    batch_size = coords_to_render.shape[0] - i
+
+                batch_coords = coords_to_render[i:i+batch_size] # [4096, 3]
+                ori = (batch_coords * aabb_lengths) + min_pt[0] # [4096, 3]
+                start = torch.zeros_like(ori)
+                end = torch.zeros_like(ori)
+
+                if not (use_fixed_viewdirs):
+                    rgbs = []
+                    densities = []    
+                    for j in range(cams.size):
+                        trans_mat = cams[j].camera_to_worlds
+                        viewdir = torch.Tensor(torch.Tensor(trans_mat[:3, :3]).unsqueeze(0) @ torch.Tensor([0, 0, -1]))
+
+                        dir = viewdir.expand(batch_size, -1).to(model.device)
+                        f = Frustums(ori, dir, start, end, None)
+                        cam_indices = torch.zeros((batch_size,1), dtype=torch.int)
+                        rays = RaySamples(f, camera_indices=cam_indices).to(model.device)
+    
+                        field_outputs = vision_field.forward(rays)
+
+                        rgb = field_outputs[FieldHeadNames.RGB]
+                        density = field_outputs[FieldHeadNames.DENSITY]
+
+                        rgbs.append(rgb.cpu())
+                        densities.append(density.cpu())
+
+                    rgb = torch.mean(torch.stack(rgbs, dim=0), dim=0)          # [4096, 3]
+                    density = torch.mean(torch.stack(densities, dim=0), dim=0) # [4096, 1]
+
+                else:
+                    # Generate fixed view directions...
+                    return
+
+                grid_sampler.update_feature_grid(batch_coords, rgb, density) 
+                progress.update(task, advance=batch_size)
+            
+        vision_field.module.spatial_distortion = spatial_distort
+
+        # Extract (res_z * res_y * res_x, 4) from grid_sampler
+        rgbsigma = grid_sampler.get_nerf_rpn_output()
+
+        CONSOLE.print(f"[bold yellow]rgbsigma: {rgbsigma.size()}")
+        exit()
+
+        # Save rgbsigma
+        rgbsigma = rgbsigma.cpu().numpy()
+        min_pt = min_pt.cpu().numpy()
+        max_pt = max_pt.cpu().numpy()
+        CONSOLE.print(f"[bold blue]Saving rgbsigma of size: {rgbsigma.shape}")
+        np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
+                            bbox_min=min_pt, bbox_max=max_pt,
+                            scale=0.3333, offset=0.0)
 
 def validate_pipeline(normal_method: str, normal_output_name: str, pipeline: Pipeline) -> None:
     """Check that the pipeline is valid for this exporter.
@@ -825,41 +1002,39 @@ class ExportGaussianSplat(Exporter):
 
         ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors)
 
-
-###########################
-########################### BEGIN of ADDED
-###########################
-
 @dataclass
 class ExportNeRFRGBDensity(Exporter):
     """
     Export RGB and density values from a NeRF model using camera view directions and spatial locations.
     Note: Only queries points within the scene bounding box.
     """
-    nerf_model: Literal["splatfacto", "nerfacto", "zipnerf"] = "splatfacto"
+    nerf_model: Literal["splatfacto", "nerfacto", "zipnerf"] = "zipnerf"
     """Name of NeRF model utilized"""
     scene_name: str = "ai_001_001"
     """Name of the pre-trained scene"""
     dataset_type: Literal["hypersim"] = "hypersim"
-    """Name of the dataset which will be used. Update for future datasets."""
+    """Name of the dataset which will be used. TODO: Update for future datasets."""
     dataset_path: str = "hypersim"
     """The path to the scenes in instant-ngp data format."""
     transforms_filename: str = "transforms.json"
     """The name of the transforms file containing camera metadata, camera poses and bounding boxes."""
     ckpt_name: str = "step-000006999.ckpt"
     """Name of the snapshot/checkpoint"""
-    max_res: int = 256
-    """The maximum resolution of the output."""
+    max_res: int = 128
+    """The maximum resolution of the extracted features."""
     crop_bbox: bool = True
     """Whether to crop the scene bounding box or not."""
+    use_fixed_viewdirs: bool = False
+    """Whether to use fixed view directions for sampling"""
+    batch_size: int = 4096
+    """Batch size for number of rays to compute"""
 
     def main(self) -> None:
         if not self.output_dir.exists():
             self.output_dir.mkdir(parents=True)
             
-        _, pipeline, ckpt_path, _ = eval_setup(self.load_config)
-        #self.scene_name =  os.path.basename(c_.pipeline.datamanager.data)
-        self.scene_name = 'ai_002_005'
+        conf, pipeline, ckpt_path, _ = eval_setup(self.load_config)
+        self.scene_name =  os.path.basename(conf.pipeline.datamanager.data)
 
         scene_dir = os.path.join(self.dataset_path, self.scene_name, 'train')
         if 'transforms.json' not in os.listdir(scene_dir):
@@ -884,15 +1059,11 @@ class ExportNeRFRGBDensity(Exporter):
 
         query_nerf_model(
             self.nerf_model, model, pipeline, json_path, out_path, 
-            self.dataset_type, self.max_res, self.crop_bbox
+            self.dataset_type, self.max_res, self.crop_bbox,
+            self.use_fixed_viewdirs, self.batch_size
         )
 
         CONSOLE.print(f"[bold green]:white_check_mark: Done extracting scene: {self.scene_name}")
-
-
-###########################
-########################### END of ADDED
-###########################
 
 
 Commands = tyro.conf.FlagConversionOff[
