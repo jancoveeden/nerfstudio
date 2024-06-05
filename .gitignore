@@ -189,6 +189,7 @@ camera_paths/
 */**/._.DS_Store
 
 # Models
+zipnerf-pytorch/.git
 
 # pixi environments
 .pixi
