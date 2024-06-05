@@ -52,7 +52,6 @@ from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from zipnerf_ns.zipnerf_model import ZipNerfModel 
-sys.path.append(r"C:\Users\OEM\nerf-gs-detect\nerfstudio\zipnerf-pytorch") 
 from extract import get_rgbsigma
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from nerfstudio.cameras.rays import RaySamples, Frustums
@@ -1051,6 +1050,7 @@ class ExportNeRFRGBDensity(Exporter):
             assert isinstance(pipeline.model, NerfactoModel)
             model: NerfactoModel = pipeline.model
         elif (self.nerf_model == "zipnerf"):
+            sys.path.append(r"C:\Users\OEM\nerf-gs-detect\nerfstudio\zipnerf-pytorch") 
             assert isinstance(pipeline.model, ZipNerfModel)
             model: ZipNerfModel = pipeline.model
         else:
