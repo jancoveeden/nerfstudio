@@ -123,7 +123,8 @@ class Grid_Sampler:
                                     torch.arange(self.grid_limits[2], self.grid_limits[3], self.voxel_grid_step), 
                                     torch.arange(self.grid_limits[4], self.grid_limits[5], self.voxel_grid_step), 
                                     indexing='ij')
-        grid_v_coords = torch.stack(grid_v_coords, dim=0)
+        grid_v_coords = torch.stack(grid_v_coords, dim=0).detach().cpu()
+        torch.cuda.empty_cache()
 
         return grid_v_coords
 
@@ -132,7 +133,8 @@ class Grid_Sampler:
                                     torch.linspace(self.grid_limits[2], self.grid_limits[3], self.max_res), 
                                     torch.linspace(self.grid_limits[4], self.grid_limits[5], self.max_res), 
                                     indexing='ij')
-        grid_coords = torch.stack(grid_coords, dim=0)
+        grid_coords = torch.stack(grid_coords, dim=0).detach().cpu()
+        torch.cuda.empty_cache()
 
         return grid_coords
 
@@ -364,16 +366,18 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
         
     elif (nerf_name == "nerfacto"):
         grid_limits = np.array([min_pt[0],max_pt[0],min_pt[1],max_pt[1],min_pt[2],max_pt[2]])
-        grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu")
+        grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu") # [7, 128, 128, 128]
         grid_coords = grid_sampler.generate_coords()
         grid_sampler.grid[4:,:,:,:] = grid_coords
-        coords_to_render = grid_coords.view(-1, 3)
+        coords_to_render = grid_coords.view(-1, 3) # [2097152, 3]
 
         vision_field = model.field
         spatial_distort = vision_field.spatial_distortion
         vision_field.spatial_distortion = None
 
         aabb_lengths = max_pt[1] - min_pt[0] 
+
+        batch_size = 16384 #2048 #16384 #8192
 
         CONSOLE.print(f"[bold blue]grid size: {grid_sampler.grid.size()}") # [7, 128, 128, 128]
         CONSOLE.print(f"[bold blue]coords_to_render size: {coords_to_render.size()}") # [2097152, 3]
@@ -402,7 +406,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
                         trans_mat = cams[j].camera_to_worlds
                         viewdir = torch.Tensor(torch.Tensor(trans_mat[:3, :3]).unsqueeze(0) @ torch.Tensor([0, 0, -1]))
 
-                        dir = viewdir.expand(batch_size, -1).to(model.device)
+                        dir = viewdir.expand(batch_size, -1)#.to(model.device)
                         f = Frustums(ori, dir, start, end, None)
                         cam_indices = torch.zeros((batch_size,1), dtype=torch.int)
                         rays = RaySamples(f, camera_indices=cam_indices).to(model.device)
@@ -414,6 +418,9 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
 
                         rgbs.append(rgb.cpu())
                         densities.append(density.cpu())
+                        
+                        #torch.cuda.empty_cache()
+                        #exit()
 
                     rgb = torch.mean(torch.stack(rgbs, dim=0), dim=0)          # [4096, 3]
                     density = torch.mean(torch.stack(densities, dim=0), dim=0) # [4096, 1]
@@ -424,6 +431,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
 
                 grid_sampler.update_feature_grid(batch_coords, rgb, density) 
                 progress.update(task, advance=batch_size)
+                torch.cuda.empty_cache()
             
         vision_field.module.spatial_distortion = spatial_distort
 
