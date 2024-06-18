@@ -54,6 +54,9 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from nerfstudio.cameras.rays import RaySamples, Frustums
 from nerfstudio.field_components.field_heads import FieldHeadNames
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 class Grid_Sampler:
     """Grid sampler to represent a scene as a grid of voxels.
@@ -78,10 +81,13 @@ class Grid_Sampler:
         self.grid_step = (self.grid_limits[1] - self.grid_limits[0]) / (max_res - 1)
         self.voxel_grid_step = (self.grid_limits[1] - self.grid_limits[0]) / max_res
         self.max_res = max_res
-        self.delta = 1e-2
         self.device = device
 
         self.grid = torch.zeros(7, int(max_res), int(max_res), int(max_res), dtype=torch.float32, device=device)
+
+    def density_to_alpha(self, density):
+        activ = torch.clip(density, min=0, max=None)
+        return torch.clip(1.0 - torch.exp(-activ / 100.0), 0.0, 1.0)
 
     def update_feature_grid(self, rays_xyz, rgb, density):
         """
@@ -92,31 +98,47 @@ class Grid_Sampler:
             rgb: Average rgb values for given view directions
             density: Average density values for given view directions
         """
-        rays_xyz = rays_xyz.reshape(-1, 3).to(self.device)  # [4096, 3]
-        rgb = rgb.reshape(-1, 3).to(self.device)            # [4096, 3]
-        density = density.reshape(-1, 1).to(self.device)    # [4096, 1]
+        rays_xyz = rays_xyz.reshape(-1, 3).to(self.device)  # [batch_size, 3]
+        rgb = rgb.reshape(-1, 3).to(self.device)            # [batch_size, 3]
+        density = density.reshape(-1, 1).to(self.device)    # [batch_size, 1]
     
-        alpha = torch.clip(1 - torch.exp(-self.delta * density), 0, 1)
-        colour = torch.sigmoid(rgb)
+        #alpha = torch.clip(1 - torch.exp(-1e-2 * density), 0, 1)
+        alpha = self.density_to_alpha(density)  # [batch_size, 1]
+        colour = torch.sigmoid(rgb)             # [batch_size, 3]
 
-        xs = ((rays_xyz[:, 0] - self.grid_limits[0]) / self.grid_step).int() # [4096]
-        ys = ((rays_xyz[:, 1] - self.grid_limits[2]) / self.grid_step).int() # [4096]
-        zs = ((rays_xyz[:, 2] - self.grid_limits[4]) / self.grid_step).int() # [4096]
+        #rays_xyz = (rays_xyz - self.grid_limits[0]) / (self.grid_limits[1] - self.grid_limits[0])
+
+        # Convert coordinates to grid indexes:
+        x_idxs = ((rays_xyz[:, 0] - self.grid_limits[0]) / self.grid_step).int() # [batch_size]
+        y_idxs = ((rays_xyz[:, 1] - self.grid_limits[2]) / self.grid_step).int() # [batch_size]
+        z_idxs = ((rays_xyz[:, 2] - self.grid_limits[4]) / self.grid_step).int() # [batch_size]
+        # x_idxs = (rays_xyz[:, 0] * (self.max_res - 1)).int() # [batch_size]
+        # y_idxs = (rays_xyz[:, 1] * (self.max_res - 1)).int() # [batch_size]
+        # z_idxs = (rays_xyz[:, 2] * (self.max_res - 1)).int() # [batch_size]
+
+        #CONSOLE.print(f"[bold yellow]index: ({x_idxs[0]}, {y_idxs[0]}, {z_idxs[0]})")
+        #CONSOLE.print(f"[bold yellow]index: ({x_idxs})")
+        #CONSOLE.print(f"[bold yellow]index: ({rays_xyz[0, 0]}, {rays_xyz[1, 1]}, {rays_xyz[0, 1]})")
+
+        mask = (x_idxs >= 0) & (x_idxs < self.grid.shape[1]) & \
+               (y_idxs >= 0) & (y_idxs < self.grid.shape[2]) & \
+               (z_idxs >= 0) & (z_idxs < self.grid.shape[3])
         
-        mask = (xs >= 0) & (xs < self.grid.shape[1]) & (ys >= 0) & (ys < self.grid.shape[2]) & (zs >= 0) & (zs < self.grid.shape[3])
+        x_idxs = x_idxs[mask]
+        y_idxs = y_idxs[mask]
+        z_idxs = z_idxs[mask]
 
-        xs = xs[mask]
-        ys = ys[mask]
-        zs = zs[mask]
-        # colour = colour[mask].to(torch.float16)
-        # alpha = alpha[mask].to(torch.float16)
         colour = colour[mask].float()
         alpha = alpha[mask].float()
 
-        self.grid[0, xs, ys, zs] = colour[:, 0].squeeze() # [4096]
-        self.grid[1, xs, ys, zs] = colour[:, 1].squeeze() # [4096]
-        self.grid[2, xs, ys, zs] = colour[:, 2].squeeze() # [4096]
-        self.grid[3, xs, ys, zs] = alpha.squeeze()        # [4096]
+        #CONSOLE.print(f"[bold yellow]index: ({x_idxs[0]}, {y_idxs[0]}, {z_idxs[0]})")
+        #CONSOLE.print(f"[bold yellow]colour pixel: {colour[0, :]}")
+        #CONSOLE.print(f"[bold yellow]alpha: {alpha[0]}")
+
+        self.grid[0, x_idxs, y_idxs, z_idxs] = colour[:, 0].squeeze() # [batch_size]
+        self.grid[1, x_idxs, y_idxs, z_idxs] = colour[:, 1].squeeze() # [batch_size]
+        self.grid[2, x_idxs, y_idxs, z_idxs] = colour[:, 2].squeeze() # [batch_size]
+        self.grid[3, x_idxs, y_idxs, z_idxs] = alpha.squeeze()        # [batch_size]
     
     def generate_voxel_coords(self):
         grid_v_coords = torch.meshgrid(torch.arange(self.grid_limits[0], self.grid_limits[1], self.voxel_grid_step), 
@@ -124,7 +146,6 @@ class Grid_Sampler:
                                     torch.arange(self.grid_limits[4], self.grid_limits[5], self.voxel_grid_step), 
                                     indexing='ij')
         grid_v_coords = torch.stack(grid_v_coords, dim=0).detach().cpu()
-        torch.cuda.empty_cache()
 
         return grid_v_coords
 
@@ -134,19 +155,73 @@ class Grid_Sampler:
                                     torch.linspace(self.grid_limits[4], self.grid_limits[5], self.max_res), 
                                     indexing='ij')
         grid_coords = torch.stack(grid_coords, dim=0).detach().cpu()
-        torch.cuda.empty_cache()
+        
+        ### 
+        x = torch.linspace(self.grid_limits[0], self.grid_limits[1], self.max_res)
+        y = torch.linspace(self.grid_limits[2], self.grid_limits[3], self.max_res)
+        z = torch.linspace(self.grid_limits[4], self.grid_limits[5], self.max_res)
+        z, y, x = torch.meshgrid(z, y, x, indexing="ij")
+        grid_coords = torch.stack([x, y, z], dim=-1).reshape(3, self.max_res,self.max_res,self.max_res).cpu()
 
         return grid_coords
 
     def get_nerf_rpn_output(self):
         """
         Returns rgbsigma in the NeRF-RPN format
+        Shape: (res_z * res_y * res_x, 4)
         Refer to https://github.com/lyclyc52/NeRF_RPN
         """
         rgbsigma = self.grid[:4,:,:,:]
+        rgbsigma = rgbsigma.view(-1, 4) # (res_z * res_y * res_x, 4)
 
         return rgbsigma
 
+    def plot_feature_grid(self):
+        rgbsigma = self.grid[:4,:,:,:]
+        rgbsigma = rgbsigma.view(self.max_res, self.max_res, self.max_res, 4)
+        rgbsigma = rgbsigma.cpu().numpy()
+
+        rgb = rgbsigma[...,:3]
+        alpha = rgbsigma[..., 3]
+
+        threshold = 0.1
+        mask = alpha > threshold
+        alpha_norm = (alpha - alpha.min()) / (alpha.max() - alpha.min())
+
+        rgba = np.zeros((self.max_res, self.max_res, self.max_res, 4))
+        rgba[..., :3] = rgb 
+        rgba[..., 3] = alpha_norm
+
+        fig = plt.figure(figsize=(10, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.voxels(mask, facecolors=rgba, edgecolor='k')
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        ax.set_zlabel('z')
+        plt.show()
+    
+    def plot_voxel_grid(self):
+        rgbsigma = self.grid[:4,:,:,:]
+        rgbsigma = rgbsigma.view(self.max_res, self.max_res, self.max_res, 4)
+        rgbsigma = rgbsigma.cpu().numpy()
+
+        rgb = rgbsigma[..., :3]
+        alpha = rgbsigma[..., 3]
+
+        alpha_threshold = 0.1
+        filled = alpha > alpha_threshold
+
+        x, y, z = np.where(filled)
+        colors = rgb[filled]
+
+        fig = plt.figure(figsize=(10, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        colors = colors / colors.max()
+        ax.scatter(x, y, z, c=colors, marker='o')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        plt.show()
 
 @dataclass
 class Exporter:
@@ -156,9 +231,6 @@ class Exporter:
     """Path to the config YAML file."""
     output_dir: Path
     """Path to the output directory."""
-
-def density_to_alpha(density):
-    return np.clip(1.0 - np.exp(-np.exp(density) / 100.0), 0.0, 1.0)
 
 def nerf_matrix_to_ngp(nerf_matrix, scale=0.33, offset=[0.5, 0.5, 0.5]):
     """
@@ -176,26 +248,26 @@ def nerf_matrix_to_ngp(nerf_matrix, scale=0.33, offset=[0.5, 0.5, 0.5]):
 
     return ngp_matrix
 
-def collect_view_dirs(frames):
-        """
-        Get view directions from each frame's transform matrices
-        from NeRF-RPN instant-ngp
-        """
-        # cam_matrices = [np.array(x['transform_matrix']) for x in frames]
-        # ngp_cams = [nerf_matrix_to_ngp(cam_matrix[:-1,:]) for cam_matrix in cam_matrices]
-        # view_dirs = [cam[:, :3] @ np.array([0, 0, 1]) for cam in ngp_cams]
+# def collect_view_dirs(frames):
+#         """
+#         Get view directions from each frame's transform matrices
+#         from NeRF-RPN instant-ngp
+#         """
+#         # cam_matrices = [np.array(x['transform_matrix']) for x in frames]
+#         # ngp_cams = [nerf_matrix_to_ngp(cam_matrix[:-1,:]) for cam_matrix in cam_matrices]
+#         # view_dirs = [cam[:, :3] @ np.array([0, 0, 1]) for cam in ngp_cams]
 
-        view_dirs = []
-        for x in frames:
-            cam_matrix = np.array(x["transform_matrix"])
-            view_dir = cam_matrix[:3, 2]  # assuming the z-axis is the view direction
-            view_dirs.append(view_dir)
+#         view_dirs = []
+#         for x in frames:
+#             cam_matrix = np.array(x["transform_matrix"])
+#             view_dir = cam_matrix[:3, 2]  # assuming the z-axis is the view direction
+#             view_dirs.append(view_dir)
 
-        # poses = np.array(view_dirs).astype(np.float32)
-        # poses[:, :3, 3] *= self.config.scene_scale
-        # return poses
+#         # poses = np.array(view_dirs).astype(np.float32)
+#         # poses[:, :3, 3] *= self.config.scene_scale
+#         # return poses
 
-        return view_dirs
+#         return view_dirs
 
 def get_ngp_obj_bounding_box(xform, extent):
     """
@@ -264,15 +336,28 @@ def get_scene_bounding_box(json_dict, margin=0.1):
     ngp_max_pt = nerf_matrix_to_ngp(xform)[:, 3] # 1x3
 
     min_pt = torch.tensor(min_pt)
-    max_pt = torch.tensor(max_pt)
-
-    CONSOLE.print(f"[bold green]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}") 
+    max_pt = torch.tensor(max_pt) 
 
     return min_pt, max_pt, ngp_min_pt, ngp_max_pt
 
+def generate_fixed_viewdirs():
+    phis = [np.pi / 3, 0, -np.pi]
+    thetas = [k * np.pi / 3 for k in range(0, 6)]
+    viewdirs = []
+
+    for phi in phis:
+        for theta in thetas:
+            viewdirs.append(torch.Tensor([
+                np.cos(phi) * np.sin(theta),
+                np.cos(phi) * np.sin(theta),
+                np.sin(theta)
+            ]))
+    viewdirs = torch.stack(viewdirs, dim=0)
+    return viewdirs
+
 def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, 
                     dataset_type='hypersim', max_res=256, crop_bbox=True, 
-                    use_fixed_viewdirs=False, batch_size=4096):
+                    use_fixed_viewdirs=False, batch_size=4096, visualize=False):
     """
     Extract rgbsigma from a given pre-trained NeRF scene
 
@@ -295,16 +380,18 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
         if "bounding_boxes" in json_dict and len(json_dict['bounding_boxes']) > 0:
             bounding_boxes = json_dict["bounding_boxes"]
         else:
-            CONSOLE.print("[bold yellow]Bounding boxes in transforms.json not found. Exiting.")
+            CONSOLE.print("[bold red]Bounding boxes in transforms.json not found. Exiting.")
             sys.exit(1)
 
-    ### Get scene bbox and crop scene bbox:
+    ### Get estimated and nerfstudio scene bbox
     if dataset_type == 'hypersim':
         min_pt, max_pt, ngp_min_pt, ngp_max_pt = get_scene_bounding_box(json_dict)
+        CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+        
         scene_bbox = db_outs.scene_box
         min_pt = scene_bbox.aabb[0] # minimum (x,y,z) point
         max_pt = scene_bbox.aabb[1] # maximum (x,y,z) point
-        CONSOLE.print(f"[bold green]Scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+        CONSOLE.print(f"[bold magenta]Scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
     else:
         CONSOLE.print(f"[bold yellow]Unknown dataset type: {dataset_type}. Exiting.")
         sys.exit(1) 
@@ -317,6 +404,9 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
 
     ### Cameras
     cams = db_outs.cameras
+
+    # Check number of training images:
+    CONSOLE.print(f"[bold blue]Number of training images/views: {len(db_outs.image_filenames)}")
 
     ### Get resolution of 3D feature grid
     res = (max_pt - min_pt) / (max_pt - min_pt).max() * max_res
@@ -359,93 +449,96 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
         rgbsigma = rgbsigma.cpu().numpy()
         min_pt = min_pt.cpu().numpy()
         max_pt = max_pt.cpu().numpy()
-        CONSOLE.print(f"[bold blue]Saving rgbsigma of size: {rgbsigma.shape}")
+        CONSOLE.print(f"[bold green]Saving rgbsigma of size: {rgbsigma.shape}")
         np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
                             bbox_min=min_pt, bbox_max=max_pt,
                             scale=0.3333, offset=0.0)
         
     elif (nerf_name == "nerfacto"):
         grid_limits = np.array([min_pt[0],max_pt[0],min_pt[1],max_pt[1],min_pt[2],max_pt[2]])
-        grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu") # [7, 128, 128, 128]
+        grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu") # [7, max_res, max_res, max_res]
         grid_coords = grid_sampler.generate_coords()
         grid_sampler.grid[4:,:,:,:] = grid_coords
-        coords_to_render = grid_coords.view(-1, 3) # [2097152, 3]
+        coords_to_render = grid_coords.view(-1, 3) # [max_res*max_res*max_res, 3]
 
         vision_field = model.field
         spatial_distort = vision_field.spatial_distortion
         vision_field.spatial_distortion = None
-
         aabb_lengths = max_pt[1] - min_pt[0] 
 
-        batch_size = 16384 #2048 #16384 #8192
+        #CONSOLE.print(f"[bold blue]grid size: {grid_sampler.grid.size()}") # [7, 128, 128, 128]
+        #CONSOLE.print(f"[bold blue]coords_to_render size: {coords_to_render.size()}") # [2097152, 3]
+        batch_size = 16384 #8192 #128 #16384 #8192 #16384 #64 #16384 #8192
+        CONSOLE.print(f"[bold blue]Batch size set to: {batch_size}")
 
-        CONSOLE.print(f"[bold blue]grid size: {grid_sampler.grid.size()}") # [7, 128, 128, 128]
-        CONSOLE.print(f"[bold blue]coords_to_render size: {coords_to_render.size()}") # [2097152, 3]
+        with torch.no_grad():
+            with Progress(
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TimeElapsedColumn(),
+                        MofNCompleteColumn(),
+                        transient=True,
+            ) as progress:
+                task = progress.add_task("[green]Extracting feature grid...", total=coords_to_render.shape[0])
+                for i in range(0, coords_to_render.shape[0], batch_size):
+                    if i + batch_size > coords_to_render.shape[0]:
+                        batch_size = coords_to_render.shape[0] - i
 
-        with Progress(
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TimeElapsedColumn(),
-                    MofNCompleteColumn(),
-                    transient=True,
-        ) as progress:
-            task = progress.add_task("[green]Extracting feature grid...", total=coords_to_render.shape[0])
-            for i in range(0, coords_to_render.shape[0], batch_size):
-                if i + batch_size > coords_to_render.shape[0]:
-                    batch_size = coords_to_render.shape[0] - i
+                    batch_coords = coords_to_render[i:i+batch_size] # [batch_size, 3]
+                    ori = (batch_coords * aabb_lengths) + min_pt[0] # [batch_size, 3]
+                    start = torch.zeros_like(ori)
+                    end = torch.zeros_like(ori)
 
-                batch_coords = coords_to_render[i:i+batch_size] # [4096, 3]
-                ori = (batch_coords * aabb_lengths) + min_pt[0] # [4096, 3]
-                start = torch.zeros_like(ori)
-                end = torch.zeros_like(ori)
+                    if not (use_fixed_viewdirs):
+                        rgbs = []
+                        densities = []    
+                        for j in range(cams.size):
+                            trans_mat = cams[j].camera_to_worlds
+                            viewdir = torch.Tensor(torch.Tensor(trans_mat[:3, :3]) @ torch.Tensor([0, 0, -1]))
+                            
+                            dir = viewdir.expand(batch_size, -1)
+                            f = Frustums(ori, dir, start, end, None)
+                            cam_indices = torch.zeros((batch_size,1), dtype=torch.int)
+                            rays = RaySamples(f, camera_indices=cam_indices).to(model.device)
+        
+                            field_outputs = vision_field.forward(rays)
 
-                if not (use_fixed_viewdirs):
-                    rgbs = []
-                    densities = []    
-                    for j in range(cams.size):
-                        trans_mat = cams[j].camera_to_worlds
-                        viewdir = torch.Tensor(torch.Tensor(trans_mat[:3, :3]).unsqueeze(0) @ torch.Tensor([0, 0, -1]))
+                            rgb = field_outputs[FieldHeadNames.RGB]
+                            density = field_outputs[FieldHeadNames.DENSITY]
 
-                        dir = viewdir.expand(batch_size, -1)#.to(model.device)
-                        f = Frustums(ori, dir, start, end, None)
-                        cam_indices = torch.zeros((batch_size,1), dtype=torch.int)
-                        rays = RaySamples(f, camera_indices=cam_indices).to(model.device)
-    
-                        field_outputs = vision_field.forward(rays)
+                            rgbs.append(rgb.cpu())
+                            densities.append(density.cpu())
 
-                        rgb = field_outputs[FieldHeadNames.RGB]
-                        density = field_outputs[FieldHeadNames.DENSITY]
+                        rgb = torch.mean(torch.stack(rgbs, dim=0), dim=0)          # [batch_size, 3]
+                        density = torch.mean(torch.stack(densities, dim=0), dim=0) # [batch_size, 1]
 
-                        rgbs.append(rgb.cpu())
-                        densities.append(density.cpu())
-                        
-                        #torch.cuda.empty_cache()
-                        #exit()
+                    else:
+                        # Generate fixed view directions...
+                        #fixed_views = generate_fixed_viewdirs()
+                        #viewdir = fixed_views[j].expand(batch_size, -1)
+                        return
 
-                    rgb = torch.mean(torch.stack(rgbs, dim=0), dim=0)          # [4096, 3]
-                    density = torch.mean(torch.stack(densities, dim=0), dim=0) # [4096, 1]
-
-                else:
-                    # Generate fixed view directions...
-                    return
-
-                grid_sampler.update_feature_grid(batch_coords, rgb, density) 
-                progress.update(task, advance=batch_size)
-                torch.cuda.empty_cache()
+                    grid_sampler.update_feature_grid(batch_coords, rgb, density) 
+                    progress.update(task, advance=batch_size)
+                    torch.cuda.empty_cache()
             
-        vision_field.module.spatial_distortion = spatial_distort
+        vision_field.spatial_distortion = spatial_distort
 
         # Extract (res_z * res_y * res_x, 4) from grid_sampler
         rgbsigma = grid_sampler.get_nerf_rpn_output()
+        CONSOLE.print(f"[bold magenta]rgbsigma: {rgbsigma.size()}")
 
-        CONSOLE.print(f"[bold yellow]rgbsigma: {rgbsigma.size()}")
+        if (visualize):
+            grid_sampler.plot_feature_grid()
+            grid_sampler.plot_voxel_grid()
+
         exit()
 
         # Save rgbsigma
         rgbsigma = rgbsigma.cpu().numpy()
         min_pt = min_pt.cpu().numpy()
         max_pt = max_pt.cpu().numpy()
-        CONSOLE.print(f"[bold blue]Saving rgbsigma of size: {rgbsigma.shape}")
+        CONSOLE.print(f"[bold green]Saving rgbsigma of size: {rgbsigma.shape}")
         np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
                             bbox_min=min_pt, bbox_max=max_pt,
                             scale=0.3333, offset=0.0)
@@ -1035,13 +1128,20 @@ class ExportNeRFRGBDensity(Exporter):
     """Whether to use fixed view directions for sampling"""
     batch_size: int = 4096
     """Batch size for number of rays to compute"""
+    visualize: bool = False
+    """Whether to plot the extracted features in a 3D grid"""
 
     def main(self) -> None:
         if not self.output_dir.exists():
             self.output_dir.mkdir(parents=True)
             
         conf, pipeline, ckpt_path, _ = eval_setup(self.load_config)
+
         self.scene_name =  os.path.basename(conf.pipeline.datamanager.data)
+        if (self.scene_name == "train"):
+            # When instant-ngp dataset is used:
+            p = os.path.normpath(conf.pipeline.datamanager.data)
+            self.scene_name = p.split(os.sep)[-2]
 
         scene_dir = os.path.join(self.dataset_path, self.scene_name, 'train')
         if 'transforms.json' not in os.listdir(scene_dir):
@@ -1069,10 +1169,10 @@ class ExportNeRFRGBDensity(Exporter):
         query_nerf_model(
             self.nerf_model, model, pipeline, json_path, out_path, 
             self.dataset_type, self.max_res, self.crop_bbox,
-            self.use_fixed_viewdirs, self.batch_size
+            self.use_fixed_viewdirs, self.batch_size, self.visualize
         )
 
-        CONSOLE.print(f"[bold green]:white_check_mark: Done extracting scene: {self.scene_name}")
+        CONSOLE.print(f"[bold green]:white_check_mark: Saved features of extracted scene: {self.scene_name} ")
 
 
 Commands = tyro.conf.FlagConversionOff[
