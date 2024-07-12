@@ -1001,9 +1001,9 @@ class SplatfactoModel(Model):
                 #CONSOLE.print(f"[bold blue]rgb.shape: {rgb.shape}")
                 #CONSOLE.print(f"[bold blue]rgb: \n{rgb}")
                 #exit()
-            else:
+            #else:
                 # Ignore
-                rgb = self.colors[densities.argmax()]  # Sample RGB from Gaussian with max density
+                # rgb = self.colors[densities.argmax()]  # Sample RGB from Gaussian with max density
                 # OR
                 # rgb = torch.sigmoid(colors_crop[:, 0, :])
             

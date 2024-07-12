@@ -85,7 +85,7 @@ class TensoRFField(Field):
         positions = SceneBox.get_normalized_positions(ray_samples.frustums.get_positions(), self.aabb)
         positions = positions * 2 - 1
         density = self.density_encoding(positions)
-        density_enc = torch.sum(density, dim=-1)[:, :, None]
+        density_enc = torch.sum(density, dim=-1)#[:, :, None]
         relu = torch.nn.ReLU()
         density_enc = relu(density_enc)
         return density_enc
