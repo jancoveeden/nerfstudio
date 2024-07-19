@@ -75,6 +75,7 @@ class Grid_Sampler:
         grid_limits: Scene box xyz limits as an list -> (x_min, x_max, y_min, y_max, z_min, z_max)
         max_res: int: Maximum resolution for x, y, z-axis
         device: Device where the grid must be stored
+        nerf_name: Name of the NeRF model used
     """
 
     def __init__(self, grid_limits, max_res, device="cpu", nerf_name="nerfacto") -> None:
@@ -83,12 +84,15 @@ class Grid_Sampler:
         self.device = device
         self.nerf_name = nerf_name
 
-        self.grid = torch.zeros(7, int(max_res), int(max_res), int(max_res), dtype=torch.float32, device=device)
+        max_pt = torch.Tensor(self.grid_limits[1::2])
+        min_pt = torch.Tensor(self.grid_limits[::2])
+        scale_factor = (self.max_res - 0.) / torch.max(max_pt - min_pt)
+        max_xyz = ((max_pt - min_pt) * scale_factor + 0.).to(torch.int64)
+        self.grid = torch.zeros(7, max_xyz[0], max_xyz[1], max_xyz[2], dtype=torch.float32, device=device)
+        self.max_xyz = max_xyz
 
         # Unused
         self.delta = 1e-2
-        self.grid_step = (self.grid_limits[1] - self.grid_limits[0]) / (max_res - 1)
-        self.voxel_grid_step = (self.grid_limits[1] - self.grid_limits[0]) / max_res
 
     def density_to_alpha(self, density):
         """
@@ -121,50 +125,43 @@ class Grid_Sampler:
         rgb = rgb.reshape(-1, 3).to(self.device)            # [batch_size, 3]
         density = density.reshape(-1, 1).to(self.device)    # [batch_size, 1]
 
-        alpha = self.density_to_alpha(density)  # [batch_size, 1]
-        colour = torch.sigmoid(rgb)             # [batch_size, 3]
+        alpha = self.density_to_alpha(density)              # [batch_size, 1]
+        colour = torch.sigmoid(rgb)                         # [batch_size, 3]
 
         rays_xyz = (rays_xyz - self.grid_limits[::2]) / (self.grid_limits[1::2] - self.grid_limits[::2])
-        idxs = (rays_xyz * (self.max_res - 1)).round().int()
+        idxs = (rays_xyz * (self.max_xyz - 1)).round().int()
         x_idxs, y_idxs, z_idxs = idxs[:, 0], idxs[:, 1], idxs[:, 2]
 
-        mask = (x_idxs >= 0) & (x_idxs < self.grid.shape[1]) & \
-               (y_idxs >= 0) & (y_idxs < self.grid.shape[2]) & \
-               (z_idxs >= 0) & (z_idxs < self.grid.shape[3])
+        # CONSOLE.print(f"[bold blue]self.max_xyz: {self.max_xyz}")
+        # CONSOLE.print(f"[bold blue]rays_xyz: {rays_xyz}")
+        # CONSOLE.print(f"[bold blue]idxs: {idxs}")
+
+        # mask = (x_idxs >= 0) & (x_idxs < self.grid.shape[1]) & \
+        #        (y_idxs >= 0) & (y_idxs < self.grid.shape[2]) & \
+        #        (z_idxs >= 0) & (z_idxs < self.grid.shape[3])
         
-        x_idxs = x_idxs[mask]
-        y_idxs = y_idxs[mask]
-        z_idxs = z_idxs[mask]
+        # x_idxs = x_idxs[mask]
+        # y_idxs = y_idxs[mask]
+        # z_idxs = z_idxs[mask]
 
-        colour = colour[mask].float()
-        alpha = alpha[mask].float()
+        # colour = colour[mask].float()
+        # alpha = alpha[mask].float()
 
-        self.grid[0, x_idxs, y_idxs, z_idxs] = colour[:, 0].squeeze() # [batch_size]
-        self.grid[1, x_idxs, y_idxs, z_idxs] = colour[:, 1].squeeze() # [batch_size]
-        self.grid[2, x_idxs, y_idxs, z_idxs] = colour[:, 2].squeeze() # [batch_size]
-        self.grid[3, x_idxs, y_idxs, z_idxs] = alpha.squeeze()        # [batch_size]
-    
-    def generate_voxel_coords(self):
-        """
-        Generates xyz coordinates for a voxel grid with voxel_grid_step step size
-        """
-        grid_v_coords = torch.meshgrid(torch.arange(self.grid_limits[0], self.grid_limits[1], self.voxel_grid_step), 
-                                    torch.arange(self.grid_limits[2], self.grid_limits[3], self.voxel_grid_step), 
-                                    torch.arange(self.grid_limits[4], self.grid_limits[5], self.voxel_grid_step), 
-                                    indexing='ij')
-        grid_v_coords = torch.stack(grid_v_coords, dim=0).detach().cpu()
-
-        return grid_v_coords
+        self.grid[0, x_idxs, y_idxs, z_idxs] = colour[:, 0].float().squeeze() # [batch_size]
+        self.grid[1, x_idxs, y_idxs, z_idxs] = colour[:, 1].float().squeeze() # [batch_size]
+        self.grid[2, x_idxs, y_idxs, z_idxs] = colour[:, 2].float().squeeze() # [batch_size]
+        self.grid[3, x_idxs, y_idxs, z_idxs] = alpha.float().squeeze()        # [batch_size]
 
     def generate_coords(self):
         """
         Generates xyz coordinates for a point grid
         """
-        x = torch.linspace(self.grid_limits[0], self.grid_limits[1], self.max_res)
-        y = torch.linspace(self.grid_limits[2], self.grid_limits[3], self.max_res)
-        z = torch.linspace(self.grid_limits[4], self.grid_limits[5], self.max_res)
+        x = torch.linspace(self.grid_limits[0], self.grid_limits[1], self.max_xyz[0], dtype=torch.float64)
+        y = torch.linspace(self.grid_limits[2], self.grid_limits[3], self.max_xyz[1], dtype=torch.float64)
+        z = torch.linspace(self.grid_limits[4], self.grid_limits[5], self.max_xyz[2], dtype=torch.float64)
         x, y, z = torch.meshgrid(x, y, z, indexing="ij")
-        grid_coords = torch.stack([x, y, z], dim=-1).reshape(3, self.max_res,self.max_res,self.max_res).cpu()
+        #z, y, x = torch.meshgrid(z, y, x, indexing="ij")
+        grid_coords = torch.stack([x, y, z], dim=-1).reshape(3, self.max_xyz[0],self.max_xyz[1],self.max_xyz[2]).cpu()
 
         return grid_coords
 
@@ -174,63 +171,29 @@ class Grid_Sampler:
         Converts from (res_x, res_y, res_z, 4) -> (res_x * res_y * res_z, 4)
         Refer to https://github.com/lyclyc52/NeRF_RPN
         """
+        # (W * L * H, 4) --> (res_x * res_y * res_z, 4)
         rgbsigma = self.grid[:4,:,:,:]
-        rgbsigma = rgbsigma.view(-1, 4) # (W * L * H, 4) = (res_x * res_y * res_z, 4)
+        rgbsigma = rgbsigma.view(-1, 4).cpu().numpy()
 
         return rgbsigma
 
-    def get_box_vertices_edges(self, obb, res):
+    def get_box_corners_edges(self, obb):
         """
-        Compute 8 vertices and 12 edges
+        Compute 8 corners and 12 edges
         
         position: center of obb
         extents: size of box in each direction from its center to outer surface xyz
         orientation: rotation matrix
         """
         # Sanity Check: OrientedBox(R=orientation, T=position, S=extents)
-        
-        extents = np.array(obb.S)
         orientation = np.array(obb.R)
         position = np.array(obb.T)
+        extents = np.array(obb.S)
 
-        xform = np.hstack([orientation, np.expand_dims(position, 1)]) # [3 x 3 | 3 x 1] or [R|T]
-        CONSOLE.print(f"[bold blue]xform: {xform}")
-        xform[:, [1, 2]] *= -1                                        # Multiplies -1 with 2nd column
-        CONSOLE.print(f"[bold blue]xform: {xform}")
-        xform[:, 3] = xform[:, 3] * 0.3333 + 0.                       # Scales+Offset center coordinate
-        CONSOLE.print(f"[bold blue]xform: {xform}")
-        xform = xform[[1, 2, 0], :]                                   # Cycle axes yzx --> xyz
+        extents = extents * self.scene_scale * self.bbox_scale
+        position = position * self.scene_scale * self.bbox_scale
 
-        extents = np.dot(extents, orientation.T)
-
-        CONSOLE.print(f"[bold blue]--------")
-        CONSOLE.print(f"[bold blue]BEFORE extents: {extents}")
-        extents = extents / 3.
-        extents = torch.Tensor(extents)
-        extents = (extents - self.grid_limits[::2]) / (self.grid_limits[1::2] - self.grid_limits[::2])
-        extents = (extents * (self.max_res - 1)).round().int()
-        CONSOLE.print(f"[bold blue]AFTER extents: {extents}")
-
-        CONSOLE.print(f"[bold blue]BEFORE orientation: {orientation}")
-        orientation = orientation / 3.
-        orientation = torch.Tensor(orientation)
-        orientation = (orientation - self.grid_limits[::2]) / (self.grid_limits[1::2] - self.grid_limits[::2])
-        orientation = (orientation * (self.max_res - 1)).round().int()
-        CONSOLE.print(f"[bold blue]AFTER orientation: {orientation}")
-        
-
-        CONSOLE.print(f"[bold blue]BEFORE position: {position}")
-        position = position #/ 3.
-        position = torch.Tensor(position)
-        position = (position - self.grid_limits[::2]) / (self.grid_limits[1::2] - self.grid_limits[::2])
-        position = (position * (self.max_res - 1)).round().int()
-        CONSOLE.print(f"[bold blue]AFTER position: {position}")
-
-        extents = np.array(extents)
-        orientation = np.array(orientation)
-        position = np.array(position)
-
-        verts = np.array([
+        corners = np.array([
                         [-extents[0], -extents[1], -extents[2]],
                         [extents[0], -extents[1], -extents[2]],
                         [extents[0], extents[1], -extents[2]],
@@ -240,46 +203,42 @@ class Grid_Sampler:
                         [extents[0], extents[1], extents[2]],
                         [-extents[0], extents[1], extents[2]]
                     ])
-        
-        #world_vertices = np.dot(verts, orientation.T) + position
-        world_vertices = verts + position
+        corners = np.dot(corners, orientation.T) + position
+        corners = (corners - self.grid_limits[::2]) / (self.grid_limits[1::2] - self.grid_limits[::2])
+        corners = (torch.Tensor(corners) * (self.max_xyz - 1)) # Do not round to int
+        corners = np.array(corners)
+        #CONSOLE.print(f"[bold blue]FINAL world_vertices: {world_vertices}")
 
-        CONSOLE.print(f"[bold blue]world_vertices: {world_vertices}")
+        edge_planes = [[0, 1], [1, 2], [2, 3], [3, 0],  # bottom edges
+                       [4, 5], [5, 6], [6, 7], [7, 4],  # top edges
+                       [0, 4], [1, 5], [2, 6], [3, 7]]  # connecting edges
 
-        edges = [
-                    [0, 1], [1, 2], [2, 3], [3, 0],  # bottom face
-                    [4, 5], [5, 6], [6, 7], [7, 4],  # top face
-                    [0, 4], [1, 5], [2, 6], [3, 7]   # connecting edges
-                ]
+        return corners, edge_planes
 
-        return world_vertices, edges
-
-    def plot_point_grid(self):
+    def plot_point_cloud(self, alpha_threshold=0.5):
         grid = self.grid.cpu().detach().numpy()
-        r = grid[0]
-        g = grid[1]
-        b = grid[2]
 
-        rgb = np.stack((r, g, b), axis=-1)
-        rgb = (rgb * 255).astype(np.uint8)
-        
-        depth, height, width, _ = rgb.shape
-        x, y, z = np.meshgrid(np.arange(width), np.arange(height), np.arange(depth))
-        x = x.flatten()
-        y = y.flatten()
-        z = z.flatten()
+        W, L, H = grid.shape[1:]
+        x, y, z = np.mgrid[0:W, 0:L, 0:H]
 
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
+        alphas = grid[3].flatten()
+        mask = alphas > alpha_threshold
+        alphas = alphas[mask]
 
-        colours = rgb.reshape(-1, 3) / 255.0
-        ax.scatter(x, y, z, c=colours, marker='.')
-        ax.set_xlabel('x')
-        ax.set_ylabel('y')
-        ax.set_zlabel('z')
-        plt.show()
+        x, y, z = x.flatten()[mask], y.flatten()[mask], z.flatten()[mask]
+
+        rgb = grid[:3, :, :, :].reshape(3, -1).T 
+        rgb = rgb[mask]
+
+        pcd = o3d.geometry.PointCloud()
+        points = np.vstack((x, y, z)).T
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+        o3d.visualization.draw_geometries([pcd])
+
     
-    def visualize_depth_grid(self, db_outs, obbs, res, show_poses=False, show_boxes=False):
+    def visualize_depth_grid(self, db_outs, obbs, scene_scale=0.3333, bbox_scale=0.5, show_poses=False, show_boxes=False):
         """
         Visualizes the extracted feature grid
 
@@ -303,7 +262,7 @@ class Grid_Sampler:
             colorscale='Viridis'
         ))
 
-        # Camera Positions
+        # Add camera positions as dots
         if (show_poses):
             camera_positions = []
             for cam in db_outs.cameras:
@@ -312,9 +271,8 @@ class Grid_Sampler:
                 camera_positions.append(camera_pos)
             camera_positions = torch.Tensor(np.array(camera_positions))
             cam_poses = (camera_positions - self.grid_limits[::2]) / (self.grid_limits[1::2] - self.grid_limits[::2])
-            cam_poses = (cam_poses * (self.max_res - 1)).round().int()
+            cam_poses = (cam_poses * (self.max_xyz - 1)).round().int()
 
-            # Add camera positions as dots
             fig.add_trace(go.Scatter3d(
                 x=cam_poses[:, 0],
                 y=cam_poses[:, 1],
@@ -326,12 +284,24 @@ class Grid_Sampler:
                     symbol='circle'
                 ),
                 name='Camera',
+                showlegend=False
             ))
         
-        # Object bounding boxes
+        # Add object bounding boxes
         if (show_boxes):
-            for i, obb in enumerate(obbs[:1]):
-                vertices, edges = self.get_box_vertices_edges(obb, res)
+            self.scene_scale = scene_scale
+            self.bbox_scale = bbox_scale
+            # bbox_min = self.grid_limits[::2]
+            # bbox_max = self.grid_limits[1::2]
+            bbox_min = np.array([-1., -1., -1.])
+            bbox_max = np.array([1., 1., 1.])
+
+            for i, obb in enumerate(obbs):
+                pos = np.array(obb.T) * bbox_scale * scene_scale
+                if ((pos < bbox_min).any() or (pos > bbox_max).any()):
+                    continue
+
+                vertices, edges = self.get_box_corners_edges(obb)
 
                 for edge in edges:
                     fig.add_trace(go.Scatter3d(
@@ -339,7 +309,8 @@ class Grid_Sampler:
                         y=[vertices[edge[0]][1], vertices[edge[1]][1]],
                         z=[vertices[edge[0]][2], vertices[edge[1]][2]],
                         mode='lines',
-                        line=dict(color='blue', width=2)
+                        line=dict(color='blue', width=2),
+                        showlegend=False
                     ))
                 
                 fig.add_trace(go.Scatter3d(
@@ -347,7 +318,8 @@ class Grid_Sampler:
                     y=vertices[:, 1],
                     z=vertices[:, 2],
                     mode='markers',
-                    marker=dict(size=5, color='blue')
+                    marker=dict(size=3, color='blue'),
+                    showlegend=False
                 ))
 
         fig.update_layout(scene=dict(aspectmode='data'))
@@ -361,6 +333,70 @@ class Exporter:
     """Path to the config YAML file."""
     output_dir: Path
     """Path to the output directory."""
+
+def get_ngp_obj_bounding_box(xform, extent):
+    """
+    Get AABB from the OBB of an object.
+    
+    Args:
+        xform: 3x4 matrix for rotation, translation
+        extent: 1x3 matrix for length, width, height (xyz) of bbox
+    
+    Returns:
+        min_pt: 1x3 matrix
+        max_pt: 1x3 matrix
+    """
+    corners = np.array([
+        [1, 1, 1],
+        [1, 1, -1],
+        [1, -1, -1],
+        [1, -1, 1],
+        [-1, 1, 1],
+        [-1, 1, -1],
+        [-1, -1, -1],
+        [-1, -1, 1],
+    ], dtype=float).T # 3x8
+
+    corners *= np.expand_dims(extent, 1) * 0.5 #3x8 * 3x1 = 3x8
+    corners = xform[:, :3] @ corners + xform[:, 3, None] #3x3 * 3x8 * 3x1 = 3x8
+
+    return np.min(corners, axis=1), np.max(corners, axis=1)
+
+def get_scene_bounding_box(json_dict, margin=0.1):
+    """
+    Estimates scene bounding box using object bounding boxes
+    
+    Returns:
+        min_pt: 1x3 matrix
+        max_pt: 1x3 matrix
+    """
+    min_pt = []
+    max_pt = []
+
+    # Get min & max corners for each bbox:
+    for obj in json_dict['bounding_boxes']:
+        extent = np.array(obj['extents'])
+        orientation = np.array(obj['orientation'])
+        position = np.array(obj['position'])
+
+        xform = np.hstack([orientation, np.expand_dims(position, 1)]) # 3x4 transformation matrix
+        min_pt_, max_pt_ = get_ngp_obj_bounding_box(xform, extent)
+        
+        min_pt.append(min_pt_)
+        max_pt.append(max_pt_)
+
+    min_pt = np.min(np.array(min_pt) , axis=0) # 1x3
+    max_pt = np.max(np.array(max_pt), axis=0) # 1x3
+
+    # Slightly enlarge scene bbox
+    added_pnts = (max_pt - min_pt) * margin
+    min_pt -= added_pnts
+    max_pt += added_pnts
+
+    min_pt = torch.tensor(min_pt)
+    max_pt = torch.tensor(max_pt) 
+
+    return min_pt, max_pt
 
 def generate_fixed_viewdirs():
     """
@@ -380,7 +416,7 @@ def generate_fixed_viewdirs():
     viewdirs = torch.stack(viewdirs, dim=0)
     return viewdirs
 
-def convert_transforms_to_obbs(bbox_dict, scale=0.3333):
+def parse_transforms_to_obbs(bbox_dict, scale=0.3333, min_extent=0.2):
     """
     Converts the extents, orientation and position in the transform.json
     to oriented bounding boxes (OBBs)
@@ -388,113 +424,24 @@ def convert_transforms_to_obbs(bbox_dict, scale=0.3333):
     Args:
         bbox_dict: transforms.json -> json_dict["bounding_boxes"]
     """
+
     obbs = []
     for obj in bbox_dict:
         extents = np.array(obj['extents'])
         orientation = np.array(obj['orientation'])
         position = np.array(obj['position'])
 
-        # TODO: MIGHT NEED extents *= scale
+        if (extents < min_extent).any(): # Filters out small objects
+            continue
 
         obb = OrientedBox(R=orientation, T=position, S=extents)
         obbs.append(obb)
     
     return obbs
 
-# def nerf_matrix_to_ngp(nerf_matrix, scale=0.33, offset=[0.5, 0.5, 0.5]):
-#     """
-#     Convert a matrix from the NeRF coordinate system to the instant-ngp coordinate system.
-#     """
-#     ngp_matrix = np.copy(nerf_matrix)
-#     ngp_matrix[:, 1:3] *= -1
-#     ngp_matrix[:, -1] = ngp_matrix[:, -1] * scale + offset
-
-#     # Convert xyz<-yzx
-#     tmp = np.copy(ngp_matrix[0, :])
-#     ngp_matrix[0, :] = ngp_matrix[1, :]
-#     ngp_matrix[1, :] = ngp_matrix[2, :]
-#     ngp_matrix[2, :] = tmp
-
-#     return ngp_matrix
-
-# def get_ngp_obj_bounding_box(xform, extent):
-#     """
-#     Get AABB from the OBB of an object in ngp coordinates.
-    
-#     Args:
-#         xform: 3x4 matrix for rotation, translation
-#         extent: 1x3 matrix for length, width, height (xyz) of bbox
-    
-#     Returns:
-#         min_pt: 1x3 matrix
-#         max_pt: 1x3 matrix
-#     """
-#     corners = np.array([
-#         [1, 1, 1],
-#         [1, 1, -1],
-#         [1, -1, -1],
-#         [1, -1, 1],
-#         [-1, 1, 1],
-#         [-1, 1, -1],
-#         [-1, -1, -1],
-#         [-1, -1, 1],
-#     ], dtype=float).T # 3x8
-
-#     corners *= np.expand_dims(extent, 1) * 0.5 #3x8 * 3x1 = 3x8
-#     corners = xform[:, :3] @ corners + xform[:, 3, None] #3x3 * 3x8 * 3x1 = 3x8
-
-#     return np.min(corners, axis=1), np.max(corners, axis=1)
-  
-# def get_scene_bounding_box(json_dict, margin=0.1):
-#     """
-#     Estimates scene bounding box using object bounding boxes
-    
-#     Returns:
-#         min_pt: 1x3 matrix
-#         max_pt: 1x3 matrix
-#         ngp_min_pt: 1x3 matrix
-#         ngp_max_pt: 1x3 matrix
-#     """
-#     min_pt = []
-#     max_pt = []
-
-#     # Get min & max corners for each bbox:
-#     for obj in json_dict['bounding_boxes']:
-#         extent = np.array(obj['extents'])
-#         orientation = np.array(obj['orientation'])
-#         position = np.array(obj['position'])
-
-#         xform = np.hstack([orientation, np.expand_dims(position, 1)]) # 3x4 transformation matrix
-#         min_pt_, max_pt_ = get_ngp_obj_bounding_box(xform, extent)
-        
-#         min_pt.append(min_pt_)
-#         max_pt.append(max_pt_)
-
-#     min_pt = np.array(min_pt) 
-#     max_pt = np.array(max_pt)
-#     min_pt = np.min(min_pt, axis=0) # 1x3
-#     max_pt = np.max(max_pt, axis=0) # 1x3
-
-#     # Slightly enlarge scene bbox
-#     added_pnts = (max_pt - min_pt) * margin
-#     min_pt -= added_pnts
-#     max_pt += added_pnts
-
-#     # Get min/max corners in ngp format
-#     xform = np.hstack([np.eye(3, 3), np.expand_dims(min_pt, 1)]) # 3x4
-#     ngp_min_pt = nerf_matrix_to_ngp(xform)[:, 3] # 1x3
-#     xform = np.hstack([np.eye(3, 3), np.expand_dims(max_pt, 1)])  # 3x4
-#     ngp_max_pt = nerf_matrix_to_ngp(xform)[:, 3] # 1x3
-
-#     min_pt = torch.tensor(min_pt)
-#     max_pt = torch.tensor(max_pt) 
-
-#     return min_pt, max_pt, ngp_min_pt, ngp_max_pt
-
-def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, 
-                    dataset_type='hypersim', max_res=256, crop_scene=True, 
-                    use_fixed_viewdirs=False, batch_size=4096, visualize=False,
-                    show_poses=False, show_boxes=False):
+def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset_type='hypersim', 
+                    max_res=256, batch_size=4096, min_bbox=0.2, crop_scene=True, use_fixed_viewdirs=False, 
+                    visualize=False, show_poses=False, show_boxes=False, vis_method="plotly"):
     """
     Extracts rgbsigma from a given pre-trained NeRF scene
 
@@ -506,57 +453,65 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
         output_path: Path to .npz file to save
         dataset_type: Dataset name (Hypersim)
         max_res: Maximum resolution for an axis for the feature grid 
+        batch_size: Batch size used for feature grid extraction
+        min_bbox: Minimum length/extent of a object bounding box to visualize
         crop_scene: Whether to crop the scene bounding box or not.
         use_fixed_viewdirs: Whether to generate & use fixed view directions
-        batch_size: Batch size used for feature grid extraction
-        visualize: Whether to plot feature grid using plotly
+        visualize: Whether to plot the 3D feature grid or just save the rgbsigma in .npz file
+        vis_method: Which method to use to plot the 3D feature grid
         show_poses: Whether to plot camera positions in plotly visualization
         show_boxes: Whether to plot object bboxes in plotly visualization
     """
     device = model.device
     db_outs = pipeline.datamanager.train_dataparser_outputs
-
-    # Get bounding boxes from transform.json (instant-ngp format):
-    with open(json_path) as f:
-        json_dict = json.load(f)
-        if "bounding_boxes" in json_dict and len(json_dict['bounding_boxes']) > 0:
-            bounding_boxes = json_dict["bounding_boxes"]
-            obbs = convert_transforms_to_obbs(bounding_boxes)
-        else:
-            CONSOLE.print("[bold red]Bounding boxes in transforms.json not found. Exiting.")
-            sys.exit(1)
+    scene_scale = pipeline.datamanager.train_dataparser_outputs.dataparser_scale
 
     ### Cameras
     cams = db_outs.cameras
     CONSOLE.print(f"[bold blue]Number of training images/views: {len(db_outs.image_filenames)}")
     CONSOLE.print(f"[bold blue]Batch size set to: {batch_size}")
 
-    ### Get estimated nerfstudio scene bbox and actual scene bbox
-    if dataset_type == 'hypersim':
-        #min_pt, max_pt, ngp_min_pt, ngp_max_pt = get_scene_bounding_box(json_dict)
-        #CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
-        
-        min_pt = db_outs.scene_box.aabb[0] # minimum (x,y,z) point
-        max_pt = db_outs.scene_box.aabb[1] # maximum (x,y,z) point
-        CONSOLE.print(f"[bold magenta]Nerfstudio scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+    with open(json_path) as f:
+        json_dict = json.load(f)
 
-        if (crop_scene):
-            min_pt = torch.Tensor([-1., -1., -1.])
-            max_pt = torch.Tensor([1., 1., 1.])
-            CONSOLE.print(f"[bold magenta]Cropped scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
-    else:
-        CONSOLE.print(f"[bold yellow]Unknown dataset type: {dataset_type}. Exiting.")
-        sys.exit(1) 
+        ### Get bounding boxes from transform.json (instant-ngp format):
+        if "bounding_boxes" in json_dict and len(json_dict['bounding_boxes']) > 0:
+            bboxes = json_dict["bounding_boxes"]
+            obbs = parse_transforms_to_obbs(bboxes, scene_scale, min_bbox)
+            bbox_scale = 2.0 * (1/float(json_dict["aabb_scale"])) # Reverse of 0.5 * meta.get("aabb_scale", 1)
+        else:
+            CONSOLE.print("[bold red]Bounding boxes in transforms.json not found. Exiting.")
+            sys.exit(1)
+
+        ### Get estimated nerfstudio scene bbox and actual scene bbox
+        if dataset_type == 'hypersim':
+            if (crop_scene):
+                min_pt, max_pt = get_scene_bounding_box(json_dict, margin=0.0)
+                #CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+                center = (min_pt + max_pt) / 2.0
+                scale_f = 2.0 / torch.max(max_pt - min_pt)
+                min_pt = (min_pt - center) * scale_f
+                max_pt = (max_pt - center) * scale_f
+                # min_pt = torch.Tensor([-1., -1., -1.])
+                # max_pt = torch.Tensor([1., 1., 1.])
+            else:
+                min_pt = db_outs.scene_box.aabb[0] # minimum (x,y,z) point
+                max_pt = db_outs.scene_box.aabb[1] # maximum (x,y,z) point
+            CONSOLE.print(f"[bold magenta]Using scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+
+        else:
+            CONSOLE.print(f"[bold yellow]Unknown dataset type: {dataset_type}. Exiting.")
+            sys.exit(1) 
 
     ### Get resolution of 3D feature grid
     res = (max_pt - min_pt) / (max_pt - min_pt).max() * max_res
     res = res.round().int().tolist()
 
     grid_limits = np.array([min_pt[0],max_pt[0],min_pt[1],max_pt[1],min_pt[2],max_pt[2]])
-    grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu", nerf_name=nerf_name) # [7, max_res, max_res, max_res]
+    grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu", nerf_name=nerf_name) # [7, res_x, res_y, res_z]
     grid_coords = grid_sampler.generate_coords()
     grid_sampler.grid[4:,:,:,:] = grid_coords
-    coords_to_render = grid_coords.view(-1, 3) # [max_res*max_res*max_res, 3]
+    coords_to_render = grid_coords.view(-1, 3) # [res_x*res_y*res_z, 3]
     aabb_lengths = max_pt - min_pt
 
     ### Extract RGB and density into the 3D feature grid
@@ -622,7 +577,6 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
                         batch_size = coords_to_render.shape[0] - i
 
                     batch_coords = coords_to_render[i:i+batch_size] # [batch_size, 3]
-                    #ori = (batch_coords * aabb_lengths) + min_pt   # [batch_size, 3]
                     ori = (batch_coords * aabb_lengths)             # [batch_size, 3]
                     start = torch.zeros_like(ori)
                     end = torch.zeros_like(ori)
@@ -681,22 +635,26 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path,
             vision_field.spatial_distortion = spatial_distort
 
     if (visualize):
-        grid_sampler.visualize_depth_grid(db_outs, obbs, res, show_poses, show_boxes)
-    
-    CONSOLE.print(f"[bold green]Successfully extracted rgbsigma from {nerf_name}")
-            
-    exit()
+        ## Visualize the extracted 3D feature grid
+        if (vis_method == 'plotly'):
+            grid_sampler.visualize_depth_grid(db_outs, obbs, scene_scale, bbox_scale, show_poses, show_boxes)
+        else:
+            grid_sampler.plot_point_cloud()
 
-    # Save rgbsigma
-    rgbsigma = grid_sampler.get_nerf_rpn_output()
-    CONSOLE.print(f"[bold magenta]rgbsigma: {rgbsigma.size()}")
-    rgbsigma = rgbsigma.cpu().numpy()
-    min_pt = min_pt.cpu().numpy()
-    max_pt = max_pt.cpu().numpy()
-    CONSOLE.print(f"[bold green]Saving rgbsigma of size: {rgbsigma.shape}")
-    np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
-                        bbox_min=min_pt, bbox_max=max_pt,
-                        scale=0.3333, offset=0.0)
+    else:
+        ## Save rgbsigma
+        CONSOLE.print(f"[bold green]Successfully extracted rgbsigma from {nerf_name}")
+        rgbsigma = grid_sampler.get_nerf_rpn_output()
+        #rgbsigma = rgbsigma.cpu().numpy()
+        min_pt = min_pt.cpu().numpy()
+        max_pt = max_pt.cpu().numpy()
+        res = grid_sampler.max_xyz.cpu().tolist()
+        CONSOLE.print(f"[bold green]res: {res}")
+        CONSOLE.print(f"[bold green]Feature grid size: {grid_sampler.grid.size()}")
+        CONSOLE.print(f"[bold green]Saving rgbsigma of size: {rgbsigma.shape}")
+        np.savez_compressed(output_path, rgbsigma=rgbsigma, resolution=res,
+                            bbox_min=min_pt, bbox_max=max_pt,
+                            scale=scene_scale, offset=0.0)
         
 
 def validate_pipeline(normal_method: str, normal_output_name: str, pipeline: Pipeline) -> None:
@@ -1276,7 +1234,7 @@ class ExportNeRFRGBDensity(Exporter):
     transforms_filename: str = "transforms.json"
     """The name of the transforms file containing camera metadata, camera poses and bounding boxes."""
     ckpt_name: str = "step-000006999.ckpt"
-    """Name of the snapshot/checkpoint"""
+    """Name of the snapshot/checkpoint. Currently unused."""
     max_res: int = 128
     """The maximum resolution of the extracted features."""
     crop_scene: bool = True
@@ -1286,11 +1244,15 @@ class ExportNeRFRGBDensity(Exporter):
     batch_size: int = 4096
     """Batch size for number of rays to compute"""
     visualize: bool = False
-    """Whether to plot the extracted features in a 3D grid"""
+    """Whether to plot the 3D feature grid or just save the rgbsigma in .npz file"""
+    visualize_method: Literal["plotly", "pcd"] = "plotly"
+    """Whether to plot 3D feature grid or point cloud. Only used when visualize=True"""
     show_poses: bool = False
     """Whether to plot camera positions in plotly visualization"""
     show_boxes: bool = False
     """Whether to plot object bboxes in plotly visualization"""
+    min_bbox: float = 0.2
+    """Minimum length/extent of a object bounding box to visualize. Only used when show_boxes=True"""
 
     def main(self) -> None:
         if not self.output_dir.exists():
@@ -1332,12 +1294,13 @@ class ExportNeRFRGBDensity(Exporter):
 
         query_nerf_model(
             self.nerf_model, model, pipeline, json_path, out_path, 
-            self.dataset_type, self.max_res, self.crop_scene,
-            self.use_fixed_viewdirs, self.batch_size, self.visualize,
-            self.show_poses, self.show_boxes
+            self.dataset_type, self.max_res, self.batch_size,self.min_bbox, 
+            self.crop_scene, self.use_fixed_viewdirs, self.visualize,
+            self.show_poses, self.show_boxes, self.visualize_method
         )
 
-        CONSOLE.print(f"[bold green]:white_check_mark: Saved features of extracted scene: {self.scene_name} ")
+        if not (self.visualize):
+            CONSOLE.print(f"[bold green]:white_check_mark: Saved features of extracted scene: {self.scene_name} ")
 
 
 Commands = tyro.conf.FlagConversionOff[
