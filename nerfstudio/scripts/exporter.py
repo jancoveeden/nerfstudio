@@ -55,7 +55,6 @@ from nerfstudio.models.tensorf import TensoRFModel
 
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt 
 
 class Grid_Sampler:
     """
@@ -71,8 +70,8 @@ class Grid_Sampler:
         - z_coords -> grid[6, :, : ,:]
 
     Args:
-        grid_limits: Scene box xyz limits as an list -> (x_min, x_max, y_min, y_max, z_min, z_max)
-        max_res: int: Maximum resolution for x, y, z-axis
+        grid_limits: Scene box xyz limits as a list -> (x_min, x_max, y_min, y_max, z_min, z_max)
+        max_res: int: Maximum resolution for x-, y-, z-axis
         device: Device where the grid must be stored
         nerf_name: Name of the NeRF model used
     """
@@ -133,15 +132,14 @@ class Grid_Sampler:
         rgb = rgb.reshape(-1, 3).to(self.device)            # [batch_size, 3]
         density = density.reshape(-1, 1).to(self.device)    # [batch_size, 1]
 
-        alpha = self.density_to_alpha(density)              # [batch_size, 1]
-        colour = torch.sigmoid(rgb)                         # [batch_size, 3]
+        alpha = self.density_to_alpha(density)              # [batch_size, 1]  
 
         idxs = self.map_to_grid(rays_xyz)
         x_idxs, y_idxs, z_idxs = idxs[:, 0], idxs[:, 1], idxs[:, 2]
 
-        self.grid[0, x_idxs, y_idxs, z_idxs] = colour[:, 0].float().squeeze() # [batch_size]
-        self.grid[1, x_idxs, y_idxs, z_idxs] = colour[:, 1].float().squeeze() # [batch_size]
-        self.grid[2, x_idxs, y_idxs, z_idxs] = colour[:, 2].float().squeeze() # [batch_size]
+        self.grid[0, x_idxs, y_idxs, z_idxs] = rgb[:, 0].float().squeeze()    # [batch_size]
+        self.grid[1, x_idxs, y_idxs, z_idxs] = rgb[:, 1].float().squeeze()    # [batch_size]
+        self.grid[2, x_idxs, y_idxs, z_idxs] = rgb[:, 2].float().squeeze()    # [batch_size]
         self.grid[3, x_idxs, y_idxs, z_idxs] = alpha.float().squeeze()        # [batch_size]
 
     def generate_coords(self):
@@ -205,7 +203,14 @@ class Grid_Sampler:
 
         return corners, edge_planes
 
-    def plot_point_cloud(self, alpha_threshold=0.5, save_images=False):
+    def plot_point_cloud(self, alpha_threshold=0.5):
+        """
+        Visualizes the extracted feature grid as point cloud
+
+        Args:
+            alpha_threshold: Density threshold at which points are saved
+            save_image: Whether to save an image or not.
+        """
         grid = self.grid.cpu().detach().numpy()
 
         W, L, H = grid.shape[1:]
@@ -224,14 +229,11 @@ class Grid_Sampler:
         points = np.vstack((x, y, z)).T
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.colors = o3d.utility.Vector3dVector(rgb)
-
-        if not (save_images):
-            o3d.visualization.draw_geometries([pcd])
-            #sys.exit(1)
+        o3d.visualization.draw_geometries([pcd])
 
     def visualize_depth_grid(self, db_outs, obbs, scene_scale=0.3333, bbox_scale=0.5, show_poses=False, show_boxes=False):
         """
-        Visualizes the extracted feature grid
+        Visualizes the extracted feature grid as depth grid
 
         Args:
             db_outs: Nerfstudio pipeline.datamanager.train_dataparser_outputs object
