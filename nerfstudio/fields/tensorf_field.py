@@ -81,11 +81,14 @@ class TensoRFField(Field):
 
         self.field_output_rgb = RGBFieldHead(in_dim=self.mlp_head.get_out_dim(), activation=nn.Sigmoid())
 
-    def get_density(self, ray_samples: RaySamples) -> Tensor:
+    def get_density(self, ray_samples: RaySamples, nerf_rgbd=False) -> Tensor:
         positions = SceneBox.get_normalized_positions(ray_samples.frustums.get_positions(), self.aabb)
         positions = positions * 2 - 1
         density = self.density_encoding(positions)
-        density_enc = torch.sum(density, dim=-1)#[:, :, None]
+        if (nerf_rgbd):
+            density_enc = torch.sum(density, dim=-1)
+        else:
+            density_enc = torch.sum(density, dim=-1)[:, :, None]
         relu = torch.nn.ReLU()
         density_enc = relu(density_enc)
         return density_enc
@@ -116,6 +119,7 @@ class TensoRFField(Field):
         compute_normals: bool = False,
         mask: Optional[Tensor] = None,
         bg_color: Optional[Tensor] = None,
+        nerf_rgbd=False,
     ) -> Dict[FieldHeadNames, Tensor]:
         if compute_normals is True:
             raise ValueError("Surface normals are not currently supported with TensoRF")

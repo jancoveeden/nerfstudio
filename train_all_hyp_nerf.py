@@ -1,6 +1,8 @@
 """
-Automated Hypersim training for Nerfacto, TensoRF, ZipNeRF
+Automated Hypersim training for Nerfacto, TensoRF, ZipNeRF 
+python train_all_hyp_nerf.py --db_split_dir .../hypersim_split.npz --nerf_model tensorf
 """
+
 import numpy as np
 import subprocess
 import argparse
@@ -16,7 +18,7 @@ def parse_args():
 
 args = parse_args()
 data = np.load(args.db_split_dir)
-train_scenes = data['train_scenes']
+train_scenes = data['train_scenes'][:1]
 nerf_model = args.nerf_model
 
 base_command = "ns-train {} --experiment-name nerf_data --max-num-iterations 10000 --steps-per-save 1000 --viewer.quit-on-train-completion True --output-dir {} instant-ngp-data --data {}"

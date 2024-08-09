@@ -714,8 +714,10 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
                             f = Frustums(ori, dir, start, end, None)
                             cam_indices = torch.zeros((batch_size, 1), dtype=torch.int)
                             rays = RaySamples(f, cam_indices).to(model.device)
-
-                            field_outputs = model.field.forward(rays)
+                            if (nerf_name == "tensorf"):
+                                field_outputs = model.field.forward(rays, nerf_rgbd=True)
+                            else:
+                                field_outputs = model.field.forward(rays)
                             rgb = field_outputs[FieldHeadNames.RGB]
                             density = field_outputs[FieldHeadNames.DENSITY]
 
