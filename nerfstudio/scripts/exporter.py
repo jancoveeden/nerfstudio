@@ -55,6 +55,10 @@ from nerfstudio.models.tensorf import TensoRFModel
 
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 import plotly.graph_objects as go
+from sklearn.neighbors import NearestNeighbors
+#from gsplat.cuda_legacy._torch_impl import scale_rot_to_cov3d
+#import matplotlib.pyplot as plt
+
 
 class Grid_Sampler:
     """
@@ -443,6 +447,123 @@ def parse_transforms_to_obbs(bbox_dict, scale=0.3333, min_extent=0.2):
     
     return obbs
 
+def extract_splatfacto(model, sampler, coords, cams):
+    ##########################
+    # with torch.no_grad():
+    #     renders = model.get_outputs(cams.to(model.device))
+    #     render_color = renders["rgb"].cpu().numpy()
+    #     render_depth = renders["depth"].cpu().numpy()
+    #     CONSOLE.print(f"[bold red]render_color: {render_color.shape}") # [num_images, h, w, 3]
+    #     CONSOLE.print(f"[bold red]render_depth: {render_depth.shape}") # [num_images, h, w, 1]
+
+    #     positions_3d = model.means.cpu().numpy() # [num_gaussians, 2]
+    #     positions_2d = model.xys.cpu().numpy()   # [num_cams, num_gaussians, 2]
+
+    #     grid_shape = sampler.max_xyz.cpu().numpy().tolist()
+    #     binary_grid = np.zeros(grid_shape, dtype=np.float32)
+    #     color_grid = np.zeros((grid_shape[0], grid_shape[1], grid_shape[2], 3), dtype=np.float32)
+
+    #     voxel_size = 1.0 / np.array(grid_shape)
+    #     voxel_indices = (positions_3d / voxel_size).astype(int)
+    #     voxel_indices = np.clip(voxel_indices, 0, np.array(grid_shape) - 1)
+    #     h, w, _ = render_color[0].shape
+    #     num_cams = render_color.shape[0] - 50
+
+    #     with Progress(
+    #             TextColumn("[progress.description]{task.description}"),
+    #             BarColumn(),TimeElapsedColumn(),MofNCompleteColumn(),
+    #             transient=True,
+    #     ) as progress:
+    #         task = progress.add_task("[green]Iterating through cams...", total=num_cams)
+    #         for cam_idx in range(num_cams):
+    #             image_coords = np.clip(positions_2d[cam_idx].astype(int), [0, 0], [w - 1, h - 1])
+    #             for idx, voxel_index in enumerate(voxel_indices):
+    #                 x, y = image_coords[idx]
+    #                 color = render_color[cam_idx, y, x]
+    #                 depth = render_depth[cam_idx, y, x]
+
+    #                 if abs(positions_3d[idx, 2] - depth) < 0.1:  
+    #                     color_grid[voxel_index[0], voxel_index[1], voxel_index[2], :] = color
+    #                     binary_grid[voxel_index[0], voxel_index[1], voxel_index[2]] = 1.0
+    #             progress.update(task, advance=1)
+        
+    #     color_grid = torch.from_numpy(color_grid).cpu()
+    #     binary_grid = torch.from_numpy(binary_grid).cpu()
+    #     sampler.grid[0] = color_grid[:,:,:,0]
+    #     sampler.grid[1] = color_grid[:,:,:,2]
+    #     sampler.grid[2] = color_grid[:,:,:,2]
+    #     sampler.grid[3] = binary_grid
+    # return sampler
+    ##########################
+    # using equation (3) from https://arxiv.org/abs/2405.15491
+    # with torch.no_grad():
+    #     positions = model.means.cpu().numpy()
+    #     colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
+    #     opacities = model.opacities.data.cpu().numpy()
+    #     scales = model.scales.data.cpu()
+    #     quats = model.quats.data.cpu()
+    #     covariances = scale_rot_to_cov3d(scales, 1.0, quats)
+
+    #     K = 8
+    #     density_thresh = 0.2
+    #     grid_shape = sampler.max_xyz.cpu().numpy().tolist()
+
+    #     occupancy_grid = np.zeros(grid_shape, dtype=np.float32)
+    #     voxel_size = 1.0 / np.array(grid_shape)
+    #     x = np.linspace(0.5 * voxel_size[0], 1.0 - 0.5 * voxel_size[0], grid_shape[0])
+    #     y = np.linspace(0.5 * voxel_size[1], 1.0 - 0.5 * voxel_size[1], grid_shape[1])
+    #     z = np.linspace(0.5 * voxel_size[2], 1.0 - 0.5 * voxel_size[2], grid_shape[2])
+    #     xv, yv, zv = np.meshgrid(x, y, z, indexing='ij')
+    #     voxel_centers = np.stack((xv, yv, zv), axis=-1).reshape(-1, 3)
+
+    #     voxel_centers = np.array(coords)
+
+
+    #     nbrs = NearestNeighbors(n_neighbors=K, algorithm='auto').fit(positions)
+    #     distances, indices = nbrs.kneighbors(voxel_centers)
+
+    #     with Progress(
+    #             TextColumn("[progress.description]{task.description}"),
+    #             BarColumn(),TimeElapsedColumn(),MofNCompleteColumn(),
+    #             transient=True,
+    #     ) as progress:
+    #         task = progress.add_task("[green]Extracting feature grid...", total=voxel_centers.shape[0])
+    #         for idx, voxel_center in enumerate(voxel_centers):
+    #             d_v = 0.0
+    #             for i in range(K):
+    #                 g_idx = indices[idx, i]
+    #                 mu_g = positions[g_idx]
+    #                 alpha_g = opacities[g_idx]
+    #                 sigma_g_inv = np.linalg.inv(covariances[g_idx])
+    #                 diff = voxel_center - mu_g
+    #                 d_v += alpha_g * np.exp(-0.5 * diff.T @ sigma_g_inv @ diff)
+
+    #             xyz = (torch.Tensor(voxel_center) - sampler.grid_limits[::2]) / (sampler.grid_limits[1::2] - sampler.grid_limits[::2])
+    #             occ_idx = (xyz * (sampler.max_xyz - 1)).round().int()
+    #             x, y, z = occ_idx
+    #             if (d_v > density_thresh):
+    #                 occupancy_grid[x, y, z] = 1.0
+    #             progress.update(task, advance=1)
+
+    #     occupancy_grid = torch.from_numpy(occupancy_grid).cpu()
+    #     sampler.grid[3] = occupancy_grid
+
+    # return sampler
+    ##########################
+    with torch.no_grad():    
+        positions = model.means.cpu().numpy()
+        colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy() 
+        opacities = model.opacities.data.cpu().numpy()
+
+        nbrs = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(positions)
+        dists_, indices_ = nbrs.kneighbors(coords)
+
+        rgb = torch.from_numpy(colors[indices_.flatten()])
+        density = torch.from_numpy(opacities[indices_.flatten()])
+        sampler.update_feature_grid(coords, rgb, density)
+
+    return sampler
+
 def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset_type='hypersim', 
                     max_res=256, batch_size=4096, min_bbox=0.2, crop_scene=True, use_fixed_viewdirs=False, 
                     visualize=False, show_poses=False, show_boxes=False, vis_method="plotly"):
@@ -470,6 +591,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
     db_outs = pipeline.datamanager.train_dataparser_outputs
     scene_scale = pipeline.datamanager.train_dataparser_outputs.dataparser_scale
     cams = db_outs.cameras
+    pcd_thresh = 0.5
     CONSOLE.print(f"[bold blue]Number of training images/views: {len(db_outs.image_filenames)}")
     CONSOLE.print(f"[bold blue]Batch size set to: {batch_size}")
 
@@ -494,20 +616,18 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
                 #CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
 
                 if (nerf_name == "zipnerf"):
-                    center = (min_pt + max_pt) / 2.0
                     scale_f = 2.6666 / torch.max(max_pt - min_pt)
-                    min_pt = (min_pt - center) * scale_f
-                    max_pt = (max_pt - center) * scale_f
                 elif (nerf_name == "tensorf"):
-                    center = (min_pt + max_pt) / 2.0
                     scale_f = 2.0 / torch.max(max_pt - min_pt)
-                    min_pt = (min_pt - center) * scale_f
-                    max_pt = (max_pt - center) * scale_f
                 elif (nerf_name == "nerfacto"):
-                    center = (min_pt + max_pt) / 2.0
                     scale_f = 1.3333 / torch.max(max_pt - min_pt)
-                    min_pt = (min_pt - center) * scale_f
-                    max_pt = (max_pt - center) * scale_f
+                elif (nerf_name == "splatfacto"):
+                    scale_f = 2.0 / torch.max(max_pt - min_pt)
+
+                center = (min_pt + max_pt) / 2.0
+                min_pt = (min_pt - center) * scale_f
+                max_pt = (max_pt - center) * scale_f
+
             else:
                 # min_pt = db_outs.scene_box.aabb[0] # minimum (x,y,z) point
                 # max_pt = db_outs.scene_box.aabb[1] # maximum (x,y,z) point
@@ -547,65 +667,70 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
             viewdir = torch.Tensor(torch.Tensor(trans_mat[:3, :3]) @ torch.Tensor([0, 0, -1])) # [3]
             camera_views.append(viewdir) # [num_train_views, 3]
 
+    if (nerf_name == "splatfacto"):
+        grid_sampler = extract_splatfacto(model, grid_sampler, coords_to_render, cams)
+        pcd_thresh = 0.2
+
     # Extract RGB and density into the 3D feature grid
-    with Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),TimeElapsedColumn(),MofNCompleteColumn(),
-                transient=True,
-    ) as progress:
-        task = progress.add_task("[green]Extracting feature grid...", total=coords_to_render.shape[0])
-        for i in range(0, coords_to_render.shape[0], batch_size):
-            # Check for the last batch
-            if i + batch_size > coords_to_render.shape[0]:
-                batch_size = coords_to_render.shape[0] - i
+    if not (nerf_name == "splatfacto"):
+        with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),TimeElapsedColumn(),MofNCompleteColumn(),
+                    transient=True,
+        ) as progress:
+            task = progress.add_task("[green]Extracting feature grid...", total=coords_to_render.shape[0])
+            for i in range(0, coords_to_render.shape[0], batch_size):
+                # Check for the last batch
+                if i + batch_size > coords_to_render.shape[0]:
+                    batch_size = coords_to_render.shape[0] - i
 
-            # Construct ray batch
-            batch_coords = coords_to_render[i:i+batch_size]                     # [batch_size, 3]
-            rgbs = []
-            densities = []  
-            if (nerf_name == "zipnerf"):
-                batch_coords = batch_coords.unsqueeze(0).to(device)             # [1, batch_size, 3]
-                batch_coords = torch.permute(batch_coords, (1, 0, 2))           # [batch_size, 1, 3]
-                batch_std = torch.full_like(batch_coords[..., 0], 0.0)[:, None] # [batch_size, 1, 1]
-                batch_std = batch_std.to(device)
-            elif (nerf_name == "nerfacto") or (nerf_name == "tensorf"):
-                ori = (batch_coords *  aabb_lengths)            # [batch_size, 3]
-                start = torch.zeros_like(ori)                   # [batch_size, 3]
-                end = torch.zeros_like(ori)                     # [batch_size, 3]
+                # Construct ray batch
+                batch_coords = coords_to_render[i:i+batch_size]                     # [batch_size, 3]
+                rgbs = []
+                densities = []  
+                if (nerf_name == "zipnerf"):
+                    batch_coords = batch_coords.unsqueeze(0).to(device)             # [1, batch_size, 3]
+                    batch_coords = torch.permute(batch_coords, (1, 0, 2))           # [batch_size, 1, 3]
+                    batch_std = torch.full_like(batch_coords[..., 0], 0.0)[:, None] # [batch_size, 1, 1]
+                    batch_std = batch_std.to(device)
+                elif (nerf_name == "nerfacto") or (nerf_name == "tensorf"):
+                    ori = (batch_coords *  aabb_lengths)            # [batch_size, 3]
+                    start = torch.zeros_like(ori)                   # [batch_size, 3]
+                    end = torch.zeros_like(ori)                     # [batch_size, 3]
 
-            # Iterate through camera views
-            for v in camera_views:
-                viewdir = v.to(model.device) # [3]
-                
-                with torch.no_grad():
-                    if (nerf_name == "zipnerf"):
-                        field_outputs = model.zipnerf.nerf_mlp(rand=False, means=batch_coords, 
-                                                                stds=batch_std, viewdirs=viewdir)
-                        rgb = field_outputs['rgb']
-                        density = field_outputs['density'].unsqueeze(1)
+                # Iterate through camera views
+                for v in camera_views:
+                    viewdir = v.to(model.device) # [3]
+                    
+                    with torch.no_grad():
+                        if (nerf_name == "zipnerf"):
+                            field_outputs = model.zipnerf.nerf_mlp(rand=False, means=batch_coords, 
+                                                                    stds=batch_std, viewdirs=viewdir)
+                            rgb = field_outputs['rgb']
+                            density = field_outputs['density'].unsqueeze(1)
 
-                    elif (nerf_name == "nerfacto") or (nerf_name == "tensorf"):
-                        dir = viewdir.expand(batch_size, -1)  # [3] -> [batch_size, 3]
-                        f = Frustums(ori, dir, start, end, None)
-                        cam_indices = torch.zeros((batch_size, 1), dtype=torch.int)
-                        rays = RaySamples(f, cam_indices).to(model.device)
+                        elif (nerf_name == "nerfacto") or (nerf_name == "tensorf"):
+                            dir = viewdir.expand(batch_size, -1)  # [3] -> [batch_size, 3]
+                            f = Frustums(ori, dir, start, end, None)
+                            cam_indices = torch.zeros((batch_size, 1), dtype=torch.int)
+                            rays = RaySamples(f, cam_indices).to(model.device)
 
-                        field_outputs = model.field.forward(rays)
-                        rgb = field_outputs[FieldHeadNames.RGB]
-                        density = field_outputs[FieldHeadNames.DENSITY]
+                            field_outputs = model.field.forward(rays)
+                            rgb = field_outputs[FieldHeadNames.RGB]
+                            density = field_outputs[FieldHeadNames.DENSITY]
 
-                    if (nerf_name == "tensorf") :
-                        density = density.unsqueeze(1) # [batch_size] -> [batch_size, 1]
+                        if (nerf_name == "tensorf") :
+                            density = density.unsqueeze(1) # [batch_size] -> [batch_size, 1]
 
-                    rgbs.append(rgb.cpu())
-                    densities.append(density.cpu())
+                        rgbs.append(rgb.cpu())
+                        densities.append(density.cpu())
 
-            # Add features to grid_sampler
-            rgb = torch.mean(torch.stack(rgbs, dim=0), dim=0)          # [batch_size, 3]
-            density = torch.mean(torch.stack(densities, dim=0), dim=0) # [batch_size, 1]
-            grid_sampler.update_feature_grid(batch_coords, rgb, density) 
-            progress.update(task, advance=batch_size)
-            torch.cuda.empty_cache()
+                # Add features to grid_sampler
+                rgb = torch.mean(torch.stack(rgbs, dim=0), dim=0)          # [batch_size, 3]
+                density = torch.mean(torch.stack(densities, dim=0), dim=0) # [batch_size, 1]
+                grid_sampler.update_feature_grid(batch_coords, rgb, density) 
+                progress.update(task, advance=batch_size)
+                torch.cuda.empty_cache()
 
     if (visualize):
         # Visualize the extracted 3D feature grid
@@ -613,7 +738,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
         if (vis_method == 'plotly'):
             grid_sampler.visualize_depth_grid(db_outs, obbs, scene_scale, bbox_scale, show_poses, show_boxes)
         else:
-            grid_sampler.plot_point_cloud()
+            grid_sampler.plot_point_cloud(pcd_thresh)
 
     else:
         # Save rgbsigma
@@ -1195,7 +1320,7 @@ class ExportNeRFRGBDensity(Exporter):
     
     Note: Only queries points within the specified scene bounding box.
     """
-    nerf_model: Literal["nerfacto", "zipnerf", "tensorf"] = "nerfacto"
+    nerf_model: Literal["nerfacto", "zipnerf", "tensorf", "splatfacto"] = "nerfacto"
     """Name of NeRF model utilized"""
     scene_name: str = "ai_001_001"
     """Name of the pre-trained scene"""
@@ -1261,7 +1386,7 @@ class ExportNeRFRGBDensity(Exporter):
             assert isinstance(pipeline.model, SplatfactoModel)
             model: SplatfactoModel = pipeline.model
             # TODO: Implement Splatfacto
-            sys.exit(1)
+            #sys.exit(1)
         else:
             CONSOLE.print(f"[bold yellow]Invalid NeRF model: {self.nerf_model}. Exiting.")
             sys.exit(1)
