@@ -140,7 +140,7 @@ class TensoRFField(Field):
             density = base_density
             rgb = base_rgb
         else:
-            density = self.get_density(ray_samples)
+            density = self.get_density(ray_samples, nerf_rgbd)
             rgb = self.get_outputs(ray_samples, None)
 
         return {FieldHeadNames.DENSITY: density, FieldHeadNames.RGB: rgb}

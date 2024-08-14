@@ -56,22 +56,17 @@ from nerfstudio.models.tensorf import TensoRFModel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 import plotly.graph_objects as go
 from sklearn.neighbors import NearestNeighbors
-#from gsplat.cuda_legacy._torch_impl import scale_rot_to_cov3d
-#import matplotlib.pyplot as plt
-
 
 class Grid_Sampler:
     """
-    Grid sampler to represent a scene as a grid of voxels.
+    Grid sampler to represent a scene as a grid of voxels. 
+    Adapted from NeRAF.
 
-    grid contains 7-channel 3D grid
+    grid contains 4-channel 3D grid
         - Red ------> grid[0, :, : ,:]  --|
         - Green ----> grid[1, :, : ,:]  --|--|-- rgbsigma
         - Blue -----> grid[2, :, : ,:]  --|--|
         - Alpha ----> grid[3, :, : ,:]  --|
-        - x_coords -> grid[4, :, : ,:]
-        - y_coords -> grid[5, :, : ,:]
-        - z_coords -> grid[6, :, : ,:]
 
     Args:
         grid_limits: Scene box xyz limits as a list -> (x_min, x_max, y_min, y_max, z_min, z_max)
@@ -160,7 +155,7 @@ class Grid_Sampler:
 
     def get_nerf_rpn_output(self):
         """
-        Returns rgbsigma in the NeRF-RPN format
+        Returns rgbsigma in a format similar to NeRF-RPN
         Converts from (res_x, res_y, res_z, 4) -> (res_x * res_y * res_z, 4)
         Refer to https://github.com/lyclyc52/NeRF_RPN
         """
@@ -297,7 +292,6 @@ class Grid_Sampler:
                 pos = np.array(obb.T) * bbox_scale * scene_scale
                 if ((pos < bbox_min).any() or (pos > bbox_max).any()):
                     continue
-
                 vertices, edges = self.get_box_corners_edges(obb)
 
                 for edge in edges:
@@ -359,38 +353,65 @@ def get_ngp_obj_bounding_box(xform, extent):
 
     return np.min(corners, axis=1), np.max(corners, axis=1)
 
-def get_scene_bounding_box(json_dict, margin=0.1):
+def estimate_scene_box(json_dict, nerf_name, margin=0.2):
     """
-    Estimates scene bounding box using object bounding boxes
+    Estimates scene bounding box using 
+        - Object bounding boxes
+        - Cameras
     
     Returns:
         min_pt: 1x3 matrix
         max_pt: 1x3 matrix
     """
-    min_pt = []
-    max_pt = []
+    min_box_pt = []
+    max_box_pt = []
+    min_cams_pt = []
+    max_cams_pt = []
 
-    # Get min & max corners for each bbox:
+    # Get min & max corners from bbox:
     for obj in json_dict['bounding_boxes']:
         extent = np.array(obj['extents'])
         orientation = np.array(obj['orientation'])
         position = np.array(obj['position'])
 
-        xform = np.hstack([orientation, np.expand_dims(position, 1)]) # 3x4 transformation mat
+        xform = np.hstack([orientation, np.expand_dims(position, 1)])
         min_pt_, max_pt_ = get_ngp_obj_bounding_box(xform, extent)
-        
-        min_pt.append(min_pt_)
-        max_pt.append(max_pt_)
+        min_box_pt.append(min_pt_)
+        max_box_pt.append(max_pt_)
+    min_box_pt = np.min(np.array(min_box_pt) , axis=0) # 1x3
+    max_box_pt = np.max(np.array(max_box_pt), axis=0) # 1x3
 
-    min_pt = np.min(np.array(min_pt) , axis=0) # 1x3
-    max_pt = np.max(np.array(max_pt), axis=0) # 1x3
+    # Get min & max corners from cameras:
+    camera_pos = []
+    for frame in json_dict['frames']:
+        xform = np.array(frame['transform_matrix'])
+        camera_pos.append(xform[:3, 3])
+    camera_pos = np.array(camera_pos)
+    min_cams_pt = np.min(camera_pos, axis=0) # 1x3
+    max_cams_pt = np.max(camera_pos, axis=0) # 1x3
 
-    # Slightly enlarge scene bbox
-    added_pnts = (max_pt - min_pt) * margin
-    min_pt -= added_pnts
-    max_pt += added_pnts
+    # Save the minimum and maximum corners
+    min_pt = torch.from_numpy(np.minimum(min_box_pt, min_cams_pt))
+    max_pt = torch.from_numpy(np.maximum(max_box_pt, max_cams_pt))
+    #CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+    
+    # Re-center scenebox and scale to [-1, +1] except for zipnerf
+    scales = {"zipnerf": 2.0, "tensorf": 1.0, "nerfacto": 1.0, "splatfacto": 2.0}
+    scale_f = scales.get(nerf_name, 1.0) / torch.max(max_pt - min_pt)
 
-    return torch.tensor(min_pt), torch.tensor(max_pt) 
+    center = (min_pt + max_pt) / 2.0
+    z_scale = scale_f + (margin / torch.max(max_pt - min_pt))
+
+    for i in range(3):
+        sign = 1 if center[i] <= 0 else -1
+        scale = z_scale if i == 2 else scale_f
+        min_pt[i] = (min_pt[i] + sign * center[i]) * scale
+        max_pt[i] = (max_pt[i] - sign * center[i]) * scale
+
+    min_pt = torch.clamp(min_pt, min=-scales.get(nerf_name, 1.0), max=scales.get(nerf_name, 1.0))
+    max_pt = torch.clamp(max_pt, min=-scales.get(nerf_name, 1.0), max=scales.get(nerf_name, 1.0))
+
+    return min_pt, max_pt 
 
 def generate_fixed_viewdirs():
     """
@@ -411,6 +432,9 @@ def generate_fixed_viewdirs():
     return dirs
 
 def generate_pcd_viewdirs(n_points=5):
+    """
+    Generates 18 fixed view directions for point cloud cameras
+    """
     golden_ratio = (1 + 5**0.5) / 2
     i = np.arange(0, n_points, dtype=float) + 0.5
     
@@ -448,108 +472,10 @@ def parse_transforms_to_obbs(bbox_dict, scale=0.3333, min_extent=0.2):
     return obbs
 
 def extract_splatfacto(model, sampler, coords, cams):
-    ##########################
-    # with torch.no_grad():
-    #     renders = model.get_outputs(cams.to(model.device))
-    #     render_color = renders["rgb"].cpu().numpy()
-    #     render_depth = renders["depth"].cpu().numpy()
-    #     CONSOLE.print(f"[bold red]render_color: {render_color.shape}") # [num_images, h, w, 3]
-    #     CONSOLE.print(f"[bold red]render_depth: {render_depth.shape}") # [num_images, h, w, 1]
-
-    #     positions_3d = model.means.cpu().numpy() # [num_gaussians, 2]
-    #     positions_2d = model.xys.cpu().numpy()   # [num_cams, num_gaussians, 2]
-
-    #     grid_shape = sampler.max_xyz.cpu().numpy().tolist()
-    #     binary_grid = np.zeros(grid_shape, dtype=np.float32)
-    #     color_grid = np.zeros((grid_shape[0], grid_shape[1], grid_shape[2], 3), dtype=np.float32)
-
-    #     voxel_size = 1.0 / np.array(grid_shape)
-    #     voxel_indices = (positions_3d / voxel_size).astype(int)
-    #     voxel_indices = np.clip(voxel_indices, 0, np.array(grid_shape) - 1)
-    #     h, w, _ = render_color[0].shape
-    #     num_cams = render_color.shape[0] - 50
-
-    #     with Progress(
-    #             TextColumn("[progress.description]{task.description}"),
-    #             BarColumn(),TimeElapsedColumn(),MofNCompleteColumn(),
-    #             transient=True,
-    #     ) as progress:
-    #         task = progress.add_task("[green]Iterating through cams...", total=num_cams)
-    #         for cam_idx in range(num_cams):
-    #             image_coords = np.clip(positions_2d[cam_idx].astype(int), [0, 0], [w - 1, h - 1])
-    #             for idx, voxel_index in enumerate(voxel_indices):
-    #                 x, y = image_coords[idx]
-    #                 color = render_color[cam_idx, y, x]
-    #                 depth = render_depth[cam_idx, y, x]
-
-    #                 if abs(positions_3d[idx, 2] - depth) < 0.1:  
-    #                     color_grid[voxel_index[0], voxel_index[1], voxel_index[2], :] = color
-    #                     binary_grid[voxel_index[0], voxel_index[1], voxel_index[2]] = 1.0
-    #             progress.update(task, advance=1)
-        
-    #     color_grid = torch.from_numpy(color_grid).cpu()
-    #     binary_grid = torch.from_numpy(binary_grid).cpu()
-    #     sampler.grid[0] = color_grid[:,:,:,0]
-    #     sampler.grid[1] = color_grid[:,:,:,2]
-    #     sampler.grid[2] = color_grid[:,:,:,2]
-    #     sampler.grid[3] = binary_grid
-    # return sampler
-    ##########################
-    # using equation (3) from https://arxiv.org/abs/2405.15491
-    # with torch.no_grad():
-    #     positions = model.means.cpu().numpy()
-    #     colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
-    #     opacities = model.opacities.data.cpu().numpy()
-    #     scales = model.scales.data.cpu()
-    #     quats = model.quats.data.cpu()
-    #     covariances = scale_rot_to_cov3d(scales, 1.0, quats)
-
-    #     K = 8
-    #     density_thresh = 0.2
-    #     grid_shape = sampler.max_xyz.cpu().numpy().tolist()
-
-    #     occupancy_grid = np.zeros(grid_shape, dtype=np.float32)
-    #     voxel_size = 1.0 / np.array(grid_shape)
-    #     x = np.linspace(0.5 * voxel_size[0], 1.0 - 0.5 * voxel_size[0], grid_shape[0])
-    #     y = np.linspace(0.5 * voxel_size[1], 1.0 - 0.5 * voxel_size[1], grid_shape[1])
-    #     z = np.linspace(0.5 * voxel_size[2], 1.0 - 0.5 * voxel_size[2], grid_shape[2])
-    #     xv, yv, zv = np.meshgrid(x, y, z, indexing='ij')
-    #     voxel_centers = np.stack((xv, yv, zv), axis=-1).reshape(-1, 3)
-
-    #     voxel_centers = np.array(coords)
-
-
-    #     nbrs = NearestNeighbors(n_neighbors=K, algorithm='auto').fit(positions)
-    #     distances, indices = nbrs.kneighbors(voxel_centers)
-
-    #     with Progress(
-    #             TextColumn("[progress.description]{task.description}"),
-    #             BarColumn(),TimeElapsedColumn(),MofNCompleteColumn(),
-    #             transient=True,
-    #     ) as progress:
-    #         task = progress.add_task("[green]Extracting feature grid...", total=voxel_centers.shape[0])
-    #         for idx, voxel_center in enumerate(voxel_centers):
-    #             d_v = 0.0
-    #             for i in range(K):
-    #                 g_idx = indices[idx, i]
-    #                 mu_g = positions[g_idx]
-    #                 alpha_g = opacities[g_idx]
-    #                 sigma_g_inv = np.linalg.inv(covariances[g_idx])
-    #                 diff = voxel_center - mu_g
-    #                 d_v += alpha_g * np.exp(-0.5 * diff.T @ sigma_g_inv @ diff)
-
-    #             xyz = (torch.Tensor(voxel_center) - sampler.grid_limits[::2]) / (sampler.grid_limits[1::2] - sampler.grid_limits[::2])
-    #             occ_idx = (xyz * (sampler.max_xyz - 1)).round().int()
-    #             x, y, z = occ_idx
-    #             if (d_v > density_thresh):
-    #                 occupancy_grid[x, y, z] = 1.0
-    #             progress.update(task, advance=1)
-
-    #     occupancy_grid = torch.from_numpy(occupancy_grid).cpu()
-    #     sampler.grid[3] = occupancy_grid
-
-    # return sampler
-    ##########################
+    """
+    [INCOMPLETE]
+    Can be used to visualize 3D gaussians in plotly
+    """
     with torch.no_grad():    
         positions = model.means.cpu().numpy()
         colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy() 
@@ -565,7 +491,7 @@ def extract_splatfacto(model, sampler, coords, cams):
     return sampler
 
 def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset_type='hypersim', 
-                    max_res=256, batch_size=4096, min_bbox=0.2, crop_scene=True, use_fixed_viewdirs=False, 
+                    max_res=128, batch_size=4096, min_bbox=0.2, crop_scene=True, use_fixed_viewdirs=False, 
                     visualize=False, show_poses=False, show_boxes=False, vis_method="plotly"):
     """
     Extracts rgbsigma from a given pre-trained NeRF scene
@@ -592,12 +518,9 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
     scene_scale = pipeline.datamanager.train_dataparser_outputs.dataparser_scale
     cams = db_outs.cameras
     pcd_thresh = 0.5
-    CONSOLE.print(f"[bold blue]Number of training images/views: {len(db_outs.image_filenames)}")
-    CONSOLE.print(f"[bold blue]Batch size set to: {batch_size}")
 
     with open(json_path) as f:
         json_dict = json.load(f)
-
         # Get bounding boxes from transform.json (instant-ngp format):
         if "bounding_boxes" in json_dict and len(json_dict['bounding_boxes']) > 0:
             bboxes = json_dict["bounding_boxes"]
@@ -609,41 +532,25 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
             CONSOLE.print("[bold red]Bounding boxes in transforms.json not found. Exiting.")
             sys.exit(1)
 
-        # Get estimated nerfstudio scene bbox or actual scene bbox
+        # Get estimated nerfstudio scene bbox or predefined scene bbox
         if dataset_type == 'hypersim':
             if (crop_scene):
-                min_pt, max_pt = get_scene_bounding_box(json_dict, margin=0.0)
-                #CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
-
-                if (nerf_name == "zipnerf"):
-                    scale_f = 2.6666 / torch.max(max_pt - min_pt)
-                elif (nerf_name == "tensorf"):
-                    scale_f = 2.0 / torch.max(max_pt - min_pt)
-                elif (nerf_name == "nerfacto"):
-                    scale_f = 1.3333 / torch.max(max_pt - min_pt)
-                elif (nerf_name == "splatfacto"):
-                    scale_f = 2.0 / torch.max(max_pt - min_pt)
-
-                center = (min_pt + max_pt) / 2.0
-                min_pt = (min_pt - center) * scale_f
-                max_pt = (max_pt - center) * scale_f
-
+                min_pt, max_pt = estimate_scene_box(json_dict, nerf_name)
             else:
-                # min_pt = db_outs.scene_box.aabb[0] # minimum (x,y,z) point
-                # max_pt = db_outs.scene_box.aabb[1] # maximum (x,y,z) point
-                min_pt = torch.Tensor([-1., -1., -1.])
-                max_pt = torch.Tensor([1., 1., 1.])
-            CONSOLE.print(f"[bold magenta]Using scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
-
+                min_pt = db_outs.scene_box.aabb[0] / 2.0
+                max_pt = db_outs.scene_box.aabb[1] / 2.0
         else:
             CONSOLE.print(f"[bold yellow]Unknown dataset type: {dataset_type}. Exiting.")
             sys.exit(1) 
+    
+    CONSOLE.print(f"[bold blue]Number of training images/views: {len(db_outs.image_filenames)}")
+    CONSOLE.print(f"[bold blue]Batch size set to: {batch_size}")
+    CONSOLE.print(f"[bold magenta]Using scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
 
     # Generate [7, res_x, res_y, res_z] grid and xyz coordinates
     grid_limits = np.array([min_pt[0],max_pt[0],min_pt[1],max_pt[1],min_pt[2],max_pt[2]])
     grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu", nerf_name=nerf_name) 
     grid_coords = grid_sampler.generate_coords()
-    grid_sampler.grid[4:,:,:,:] = grid_coords
     coords_to_render = grid_coords.view(-1, 3) # [res_x*res_y*res_z, 3] 
     
     # Enables SceneBox positions for Nerfacto
@@ -722,14 +629,14 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
                             density = field_outputs[FieldHeadNames.DENSITY]
 
                         if (nerf_name == "tensorf") :
-                            density = density.unsqueeze(1) # [batch_size] -> [batch_size, 1]
+                            density = density.unsqueeze(1) 
 
                         rgbs.append(rgb.cpu())
                         densities.append(density.cpu())
 
                 # Add features to grid_sampler
-                rgb = torch.mean(torch.stack(rgbs, dim=0), dim=0)          # [batch_size, 3]
-                density = torch.mean(torch.stack(densities, dim=0), dim=0) # [batch_size, 1]
+                rgb = torch.mean(torch.stack(rgbs, dim=0), dim=0)            # [batch_size, 3]
+                density = torch.mean(torch.stack(densities, dim=0), dim=0)   # [batch_size, 1]
                 grid_sampler.update_feature_grid(batch_coords, rgb, density) 
                 progress.update(task, advance=batch_size)
                 torch.cuda.empty_cache()
@@ -741,7 +648,6 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
             grid_sampler.visualize_depth_grid(db_outs, obbs, scene_scale, bbox_scale, show_poses, show_boxes)
         else:
             grid_sampler.plot_point_cloud(pcd_thresh)
-
     else:
         # Save rgbsigma
         CONSOLE.print(f"[bold green]Successfully extracted rgbsigma from {nerf_name}")
@@ -1388,7 +1294,6 @@ class ExportNeRFRGBDensity(Exporter):
             assert isinstance(pipeline.model, SplatfactoModel)
             model: SplatfactoModel = pipeline.model
             # TODO: Implement Splatfacto
-            #sys.exit(1)
         else:
             CONSOLE.print(f"[bold yellow]Invalid NeRF model: {self.nerf_model}. Exiting.")
             sys.exit(1)
