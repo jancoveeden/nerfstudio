@@ -396,7 +396,7 @@ def estimate_scene_box(json_dict, nerf_name, margin=0.2):
     #CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
     
     # Re-center scenebox and scale to [-1, +1] except for zipnerf
-    scales = {"zipnerf": 2.0, "tensorf": 1.0, "nerfacto": 1.0, "splatfacto": 2.0}
+    scales = {"zipnerf": 2.0, "tensorf": 1.0, "nerfacto": 1.0, "splatfacto": 2.0, "pynerf": 1.0}
     scale_f = scales.get(nerf_name, 1.0) / torch.max(max_pt - min_pt)
 
     center = (min_pt + max_pt) / 2.0
@@ -554,7 +554,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
     coords_to_render = grid_coords.view(-1, 3) # [res_x*res_y*res_z, 3] 
     
     # Enables SceneBox positions for Nerfacto
-    if (nerf_name == "nerfacto"):
+    if (nerf_name == "nerfacto") or (nerf_name == "pynerf"):
         model.field.spatial_distortion = None 
 
     # Crop scene boundaries
@@ -600,7 +600,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
                     batch_coords = torch.permute(batch_coords, (1, 0, 2))           # [batch_size, 1, 3]
                     batch_std = torch.full_like(batch_coords[..., 0], 0.0)[:, None] # [batch_size, 1, 1]
                     batch_std = batch_std.to(device)
-                elif (nerf_name == "nerfacto") or (nerf_name == "tensorf"):
+                else:
                     ori = (batch_coords *  aabb_lengths)            # [batch_size, 3]
                     start = torch.zeros_like(ori)                   # [batch_size, 3]
                     end = torch.zeros_like(ori)                     # [batch_size, 3]
@@ -615,10 +615,14 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
                                                                     stds=batch_std, viewdirs=viewdir)
                             rgb = field_outputs['rgb']
                             density = field_outputs['density'].unsqueeze(1)
-
-                        elif (nerf_name == "nerfacto") or (nerf_name == "tensorf"):
+                        else:
                             dir = viewdir.expand(batch_size, -1)  # [3] -> [batch_size, 3]
-                            f = Frustums(ori, dir, start, end, None)
+                            if (nerf_name == "pynerf"):
+                                pixel_area = torch.zeros((16384, 1))
+                                #pixel_area = cams[0].generate_rays(torch.arange(len(cameras)).unsqueeze(-1), coords=coords).pixel_area
+                                f = Frustums(ori, dir, start, end, pixel_area)
+                            else:
+                                f = Frustums(ori, dir, start, end, None)
                             cam_indices = torch.zeros((batch_size, 1), dtype=torch.int)
                             rays = RaySamples(f, cam_indices).to(model.device)
                             if (nerf_name == "tensorf"):
@@ -628,7 +632,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
                             rgb = field_outputs[FieldHeadNames.RGB]
                             density = field_outputs[FieldHeadNames.DENSITY]
 
-                        if (nerf_name == "tensorf") :
+                        if (nerf_name == "tensorf"):
                             density = density.unsqueeze(1) 
 
                         rgbs.append(rgb.cpu())
@@ -1228,7 +1232,7 @@ class ExportNeRFRGBDensity(Exporter):
     
     Note: Only queries points within the specified scene bounding box.
     """
-    nerf_model: Literal["nerfacto", "zipnerf", "tensorf", "splatfacto"] = "nerfacto"
+    nerf_model: Literal["nerfacto", "zipnerf", "tensorf", "splatfacto", "pynerf"] = "nerfacto"
     """Name of NeRF model utilized"""
     scene_name: str = "ai_001_001"
     """Name of the pre-trained scene"""
@@ -1294,6 +1298,11 @@ class ExportNeRFRGBDensity(Exporter):
             assert isinstance(pipeline.model, SplatfactoModel)
             model: SplatfactoModel = pipeline.model
             # TODO: Implement Splatfacto
+        elif (self.nerf_model == "pynerf") :
+            from pynerf.models.pynerf_model import PyNeRFModel
+            sys.path.append(r"C:\Users\OEM\nerf-gs-detect\nerfstudio\pynerf") 
+            assert isinstance(pipeline.model, PyNeRFModel)
+            model: PyNeRFModel = pipeline.model
         else:
             CONSOLE.print(f"[bold yellow]Invalid NeRF model: {self.nerf_model}. Exiting.")
             sys.exit(1)
