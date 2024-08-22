@@ -170,6 +170,8 @@ events.out.*
 
 # Data
 /data
+pynerf/
+trimiprf_nerfstudio/
 
 # Misc
 old/

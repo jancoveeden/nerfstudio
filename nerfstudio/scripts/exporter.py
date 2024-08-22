@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union, cast
 
 import numpy as np
-import open3d as o3d
 import torch
 import tyro
 from typing_extensions import Annotated, Literal
@@ -52,6 +51,8 @@ from nerfstudio.cameras.rays import RaySamples, Frustums
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.models.nerfacto import NerfactoModel
 from nerfstudio.models.tensorf import TensoRFModel
+from nerfstudio.models.depth_nerfacto import DepthNerfactoModel
+from pynerf.pynerf.models.pynerf_model import PyNeRFModel
 
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 import plotly.graph_objects as go
@@ -85,7 +86,7 @@ class Grid_Sampler:
         min_pt = torch.Tensor(self.grid_limits[::2])
         scale_factor = (self.max_res - 0.) / torch.max(max_pt - min_pt)
         max_xyz = ((max_pt - min_pt) * scale_factor + 0.).to(torch.int64)
-        self.grid = torch.zeros(7, max_xyz[0], max_xyz[1], max_xyz[2], dtype=torch.float32, device=device)
+        self.grid = torch.zeros(4, max_xyz[0], max_xyz[1], max_xyz[2], dtype=torch.float32, device=device)
         self.max_xyz = max_xyz
 
         # Unused
@@ -210,6 +211,7 @@ class Grid_Sampler:
             alpha_threshold: Density threshold at which points are saved
             save_image: Whether to save an image or not.
         """
+        import open3d as o3d
         grid = self.grid.cpu().detach().numpy()
 
         W, L, H = grid.shape[1:]
@@ -282,7 +284,7 @@ class Grid_Sampler:
         # Add object bounding boxes
         if (show_boxes):
             self.scene_scale = scene_scale
-            self.bbox_scale = bbox_scale
+            self.bbox_scale = bbox_scale 
             bbox_min = self.grid_limits[::2]
             bbox_max = self.grid_limits[1::2]
             # bbox_min = np.array([-1., -1., -1.])
@@ -353,7 +355,7 @@ def get_ngp_obj_bounding_box(xform, extent):
 
     return np.min(corners, axis=1), np.max(corners, axis=1)
 
-def estimate_scene_box(json_dict, nerf_name, margin=0.2):
+def estimate_scene_box(json_dict, nerf_name, dataset_type, margin=0.2):
     """
     Estimates scene bounding box using 
         - Object bounding boxes
@@ -363,50 +365,87 @@ def estimate_scene_box(json_dict, nerf_name, margin=0.2):
         min_pt: 1x3 matrix
         max_pt: 1x3 matrix
     """
-    min_box_pt = []
-    max_box_pt = []
-    min_cams_pt = []
-    max_cams_pt = []
+    scales = {"nerfacto": 1.0, "depth-nerfacto": 1.0, "tensorf": 1.0, "zipnerf": 2.0, "splatfacto": 2.0}
 
-    # Get min & max corners from bbox:
-    for obj in json_dict['bounding_boxes']:
-        extent = np.array(obj['extents'])
-        orientation = np.array(obj['orientation'])
-        position = np.array(obj['position'])
+    if (dataset_type == 'scannet'):
+        mini = [ins['min_pt'] for ins in json_dict['instances']]
+        maxi = [ins['max_pt'] for ins in json_dict['instances']]
 
-        xform = np.hstack([orientation, np.expand_dims(position, 1)])
-        min_pt_, max_pt_ = get_ngp_obj_bounding_box(xform, extent)
-        min_box_pt.append(min_pt_)
-        max_box_pt.append(max_pt_)
-    min_box_pt = np.min(np.array(min_box_pt) , axis=0) # 1x3
-    max_box_pt = np.max(np.array(max_box_pt), axis=0) # 1x3
+        min_pts = torch.tensor(mini)
+        max_pts = torch.tensor(maxi)
 
-    # Get min & max corners from cameras:
-    camera_pos = []
-    for frame in json_dict['frames']:
-        xform = np.array(frame['transform_matrix'])
-        camera_pos.append(xform[:3, 3])
-    camera_pos = np.array(camera_pos)
-    min_cams_pt = np.min(camera_pos, axis=0) # 1x3
-    max_cams_pt = np.max(camera_pos, axis=0) # 1x3
+        min_pt = min_pts.min(dim=0)[0]
+        max_pt = max_pts.max(dim=0)[0]
 
-    # Save the minimum and maximum corners
-    min_pt = torch.from_numpy(np.minimum(min_box_pt, min_cams_pt))
-    max_pt = torch.from_numpy(np.maximum(max_box_pt, max_cams_pt))
-    #CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+        CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+
+        # Re-center scenebox and scale to [-1, +1] except for zipnerf [-2, +2]
+        scale_f = scales.get(nerf_name, 1.0) / torch.max(max_pt - min_pt)
+        center = (min_pt + max_pt) / 2.0
+        z_scale = scale_f + (margin / torch.max(max_pt + min_pt))
+
+        if (min_pt[0] < np.abs(center[0]) + min_pt[0]) and (max_pt[0] > np.abs(center[0]) - max_pt[0]):
+            min_pt[0] = -8.0
+            max_pt[0] = 8.0
+        
+        if (min_pt[1] < np.abs(center[1]) + min_pt[1]) and (max_pt[1] > np.abs(center[1]) - max_pt[1]):
+            min_pt[1] = -8.0
+            max_pt[1] = 8.0
+
+        if (min_pt[2] < np.abs(center[2]) + min_pt[2]) and (max_pt[2] > np.abs(center[2]) - max_pt[2]):
+            min_pt[2] = -np.abs(center[2])
+            max_pt[2] = np.abs(center[2])
+
+        for i in range(3):
+            sign = 1 if center[i] <= 0 else -1
+            scale = z_scale if i == 2 else scale_f
+            min_pt[i] = (min_pt[i] + sign * center[i]) * scale
+            max_pt[i] = (max_pt[i] - sign * center[i]) * scale
+        
+    elif (dataset_type == 'hypersim'):
+        min_box_pt = []
+        max_box_pt = []
+        min_cams_pt = []
+        max_cams_pt = []
+
+        # Get min & max corners from bbox:
+        for obj in json_dict['bounding_boxes']:
+            extent = np.array(obj['extents'])
+            orientation = np.array(obj['orientation'])
+            position = np.array(obj['position'])
+
+            xform = np.hstack([orientation, np.expand_dims(position, 1)])
+            min_pt_, max_pt_ = get_ngp_obj_bounding_box(xform, extent)
+            min_box_pt.append(min_pt_)
+            max_box_pt.append(max_pt_)
+        min_box_pt = np.min(np.array(min_box_pt) , axis=0) # 1x3
+        max_box_pt = np.max(np.array(max_box_pt), axis=0) # 1x3
+
+        # Get min & max corners from cameras:
+        camera_pos = []
+        for frame in json_dict['frames']:
+            xform = np.array(frame['transform_matrix'])
+            camera_pos.append(xform[:3, 3])
+        camera_pos = np.array(camera_pos)
+        min_cams_pt = np.min(camera_pos, axis=0) # 1x3
+        max_cams_pt = np.max(camera_pos, axis=0) # 1x3
+
+        # Save the minimum and maximum corners
+        min_pt = torch.from_numpy(np.minimum(min_box_pt, min_cams_pt))
+        max_pt = torch.from_numpy(np.maximum(max_box_pt, max_cams_pt))
+        #CONSOLE.print(f"[bold magenta]Estimated scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+        
+        # Re-center scenebox and scale to [-1, +1] except for zipnerf
+        scale_f = scales.get(nerf_name, 1.0) / torch.max(max_pt - min_pt)
+        center = (min_pt + max_pt) / 2.0
+        z_scale = scale_f + (margin / torch.max(max_pt - min_pt))
+
+        for i in range(3):
+            sign = 1 if center[i] <= 0 else -1
+            scale = z_scale if i == 2 else scale_f
+            min_pt[i] = (min_pt[i] + sign * center[i]) * scale
+            max_pt[i] = (max_pt[i] - sign * center[i]) * scale
     
-    # Re-center scenebox and scale to [-1, +1] except for zipnerf
-    scales = {"zipnerf": 2.0, "tensorf": 1.0, "nerfacto": 1.0, "splatfacto": 2.0, "pynerf": 1.0}
-    scale_f = scales.get(nerf_name, 1.0) / torch.max(max_pt - min_pt)
-
-    center = (min_pt + max_pt) / 2.0
-    z_scale = scale_f + (margin / torch.max(max_pt - min_pt))
-
-    for i in range(3):
-        sign = 1 if center[i] <= 0 else -1
-        scale = z_scale if i == 2 else scale_f
-        min_pt[i] = (min_pt[i] + sign * center[i]) * scale
-        max_pt[i] = (max_pt[i] - sign * center[i]) * scale
 
     min_pt = torch.clamp(min_pt, min=-scales.get(nerf_name, 1.0), max=scales.get(nerf_name, 1.0))
     max_pt = torch.clamp(max_pt, min=-scales.get(nerf_name, 1.0), max=scales.get(nerf_name, 1.0))
@@ -448,26 +487,71 @@ def generate_pcd_viewdirs(n_points=5):
     viewdirs = np.column_stack((x, y, z))
     return torch.from_numpy(viewdirs).float()
 
-def parse_transforms_to_obbs(bbox_dict, scale=0.3333, min_extent=0.2):
+def parse_transforms_to_obbs(bbox_dict, max_xyz, dataset_type='hypersim', min_extent=0.2):
     """
-    Converts the extents, orientation and position in the transform.json
-    to oriented bounding boxes (OBBs)
+    Converts the extents, orientation and position in the 
+    transform.json/obj_instances.json to oriented bounding boxes (OBBs)
 
     Args:
-        bbox_dict: transforms.json -> json_dict["bounding_boxes"]
+        bbox_dict: json_dict
     """
-
+    res = max_xyz.cpu().numpy()
     obbs = []
-    for obj in bbox_dict:
-        extents = np.array(obj['extents'])
-        orientation = np.array(obj['orientation'])
-        position = np.array(obj['position'])
 
-        if (extents < min_extent).any(): # Filters out small objects
-            continue
+    if (dataset_type == 'hypersim'):
+        bboxes = bbox_dict["bounding_boxes"]
+        for obj in bboxes:
+            extents = np.array(obj['extents'])
+            orientation = np.array(obj['orientation'])
+            position = np.array(obj['position'])
 
-        obb = OrientedBox(R=orientation, T=position, S=extents)
-        obbs.append(obb)
+            if (extents < min_extent).any(): # Filters out small objects
+                continue
+
+            obb = OrientedBox(R=orientation, T=position, S=extents)
+            obbs.append(obb)
+    elif (dataset_type == 'scannet'):
+        bboxes = bbox_dict["instances"]
+
+        obb = np.array([x['obb'] for x in bbox_dict['instances']])
+        max_pt = np.array([x['max_pt'] for x in bbox_dict['instances']])
+        min_pt = np.array([x['min_pt'] for x in bbox_dict['instances']])
+        labels = [x['label'] for x in bbox_dict['instances']]
+        bbox_min = np.min(min_pt, axis=0)
+        bbox_max = np.max(max_pt, axis=0)
+
+        # obb[:, 3:6] = (obb[:, 3:6] / (bbox_max - bbox_min)) * 2.0
+        # obb[:, :3] = ((obb[:, :3] - bbox_min) / (bbox_max - bbox_min)) * 2.0
+
+        # keep_labels = ['bed', 'desk', 'chair']
+        # keep = np.zeros(len(obb), dtype=bool)
+        # for i in range(len(obb)):
+        #     if labels[i] in keep_labels:
+        #         keep[i] = True
+        #     elif np.min(obb[i, 3:6]) < min_extent:
+        #         keep[i] = False
+        # obb = obb[keep]
+
+        for ob in obb:
+            position = ob[:3]
+            extents = ob[3:6] 
+            angle = ob[6]
+
+            position[0] -= 4.0
+            position[1] -= 4.0
+            position[2] -= 0.8
+
+            orientation = np.array([
+                [np.cos(angle), -np.sin(angle), 0],
+                [np.sin(angle),  np.cos(angle), 0],
+                [0,              0,             1]
+            ])
+
+            if np.min(extents) < min_extent: # Filters out small objects
+                continue
+            
+            obb = OrientedBox(R=orientation, T=position, S=extents)
+            obbs.append(obb)
     
     return obbs
 
@@ -490,6 +574,22 @@ def extract_splatfacto(model, sampler, coords, cams):
 
     return sampler
 
+def compute_pixel_area(dir, nerf_model):
+    # dx = torch.sqrt(torch.sum((directions - start) ** 2, dim=-1)) 
+    # dy = torch.sqrt(torch.sum((directions - end) ** 2, dim=-1)) 
+    # pixel_area = (dx * dy)[..., None] # ("num_rays":..., 1)
+    # return pixel_area
+
+    pixel_area = None
+    if (nerf_model == 'pynerf'):
+        # Simulating neighbouring pixel ray directions
+        delta = 1e-5
+        dx = torch.sqrt(torch.sum((dir + delta - dir) ** 2, dim=-1))
+        dy = torch.sqrt(torch.sum((dir + delta - dir) ** 2, dim=-1))
+        pixel_area = (dx * dy)[..., None] # ("num_rays":..., 1)
+    
+    return pixel_area
+
 def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset_type='hypersim', 
                     max_res=128, batch_size=4096, min_bbox=0.2, crop_scene=True, use_fixed_viewdirs=False, 
                     visualize=False, show_poses=False, show_boxes=False, vis_method="plotly"):
@@ -498,11 +598,11 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
 
     Args:
         nerf_name: Name of NeRF model used for novel view synthesis
-        model: NeRF model object (Nerfacto, Zip-NeRF or TensoRF)
+        model: NeRF model object (Nerfacto, Zip-NeRF, TensoRF, Depth-Nerfacto)
         pipeline: NeRF model pipeline module
-        json_path: Path to transform.json containing bboxes, transformation matrices etc.
+        json_path: Path to bbox metadata json containing bboxes, transformation matrices etc.
         output_path: Path to .npz file to save
-        dataset_type: Dataset name (Hypersim)
+        dataset_type: Dataset name: ['hypersim', 'scannet']
         max_res: Maximum resolution for an axis for the feature grid 
         batch_size: Batch size of grid coordinates used for feature grid extraction
         min_bbox: Minimum length/extent of an object bounding box to visualize
@@ -518,61 +618,63 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
     scene_scale = pipeline.datamanager.train_dataparser_outputs.dataparser_scale
     cams = db_outs.cameras
     pcd_thresh = 0.5
+    trf = nerf_name == "tensorf"
+    zp = nerf_name == "zipnerf"
 
     with open(json_path) as f:
-        json_dict = json.load(f)
-        # Get bounding boxes from transform.json (instant-ngp format):
-        if "bounding_boxes" in json_dict and len(json_dict['bounding_boxes']) > 0:
-            bboxes = json_dict["bounding_boxes"]
-            obbs = parse_transforms_to_obbs(bboxes, scene_scale, min_bbox)
-            bbox_scale = 2.0 * (1/float(json_dict["aabb_scale"])) # Reverse of 0.5 * meta.get("aabb_scale", 1)
-            if (nerf_name == "zipnerf"):
-                bbox_scale *= 2.0 
-        else:
-            CONSOLE.print("[bold red]Bounding boxes in transforms.json not found. Exiting.")
-            sys.exit(1)
-
-        # Get estimated nerfstudio scene bbox or predefined scene bbox
-        if dataset_type == 'hypersim':
-            if (crop_scene):
-                min_pt, max_pt = estimate_scene_box(json_dict, nerf_name)
-            else:
-                min_pt = db_outs.scene_box.aabb[0] / 2.0
-                max_pt = db_outs.scene_box.aabb[1] / 2.0
-        else:
-            CONSOLE.print(f"[bold yellow]Unknown dataset type: {dataset_type}. Exiting.")
-            sys.exit(1) 
+        json_dict = json.load(f) 
     
-    CONSOLE.print(f"[bold blue]Number of training images/views: {len(db_outs.image_filenames)}")
-    CONSOLE.print(f"[bold blue]Batch size set to: {batch_size}")
-    CONSOLE.print(f"[bold magenta]Using scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
+    # Get estimated nerfstudio scene bbox or predefined scene bbox
+    if (crop_scene):
+        min_pt, max_pt = estimate_scene_box(json_dict, nerf_name, dataset_type)
+    else:
+        min_pt = db_outs.scene_box.aabb[0] #- 1.0
+        max_pt = db_outs.scene_box.aabb[1] #+ 1.0
 
-    # Generate [7, res_x, res_y, res_z] grid and xyz coordinates
+    # Generate [4, res_x, res_y, res_z] grid and xyz coordinates
     grid_limits = np.array([min_pt[0],max_pt[0],min_pt[1],max_pt[1],min_pt[2],max_pt[2]])
     grid_sampler = Grid_Sampler(grid_limits, max_res, device="cpu", nerf_name=nerf_name) 
     grid_coords = grid_sampler.generate_coords()
     coords_to_render = grid_coords.view(-1, 3) # [res_x*res_y*res_z, 3] 
+
+    # Parse bboxes and get scene + bbox scale
+    obbs = parse_transforms_to_obbs(json_dict, grid_sampler.max_xyz, dataset_type, min_bbox)
+    if dataset_type == 'hypersim':
+        bbox_scale = 2.0 * (1/float(json_dict["aabb_scale"])) # Reverse of 0.5 * meta.get("aabb_scale", 1)
+        bbox_scale *= 2.0 if zp else 1.0
+    elif dataset_type == 'scannet':
+        bbox_scale = 0.7
+        print(bbox_scale)
+        print(scene_scale)
+        print(bbox_scale * scene_scale)
     
     # Enables SceneBox positions for Nerfacto
-    if (nerf_name == "nerfacto") or (nerf_name == "pynerf"):
+    if (nerf_name in ['nerfacto', 'depth-nerfacto', 'pynerf']):
         model.field.spatial_distortion = None 
 
     # Crop scene boundaries
     aabb_lengths = max_pt - min_pt
-    if (nerf_name == "nerfacto") or (nerf_name == "tensorf"):
+    if (nerf_name in ['nerfacto', 'tensorf', 'depth-nerfacto']):
         min_pt_ = torch.Tensor([-1., -1., -1.])
         max_pt_ = torch.Tensor([1., 1., 1.])
         aabb_lengths = max_pt_ - min_pt_
 
     # Get camera view directions
+    camera_views = [] 
     if (use_fixed_viewdirs):
         camera_views = generate_fixed_viewdirs() # [18, 3]
     else:
-        camera_views = []  
         for j in range(cams.size):
             trans_mat = cams[j].camera_to_worlds
             viewdir = torch.Tensor(torch.Tensor(trans_mat[:3, :3]) @ torch.Tensor([0, 0, -1])) # [3]
             camera_views.append(viewdir) # [num_train_views, 3]
+
+    if (dataset_type == 'scannet'):
+        camera_views = camera_views[1::2]
+    #CONSOLE.print(f"[bold blue]Number of dataset images: {len(db_outs.image_filenames)}")
+    CONSOLE.print(f"[bold blue]Batch size set to: {batch_size}")
+    CONSOLE.print(f"[bold blue]Number of views to extract from: {len(camera_views)}")
+    CONSOLE.print(f"[bold magenta]Using scene bbox: \nmin_pt: {min_pt}\nmax_pt: {max_pt}")
 
     if (nerf_name == "splatfacto"):
         grid_sampler = extract_splatfacto(model, grid_sampler, coords_to_render, cams)
@@ -595,7 +697,7 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
                 batch_coords = coords_to_render[i:i+batch_size]                     # [batch_size, 3]
                 rgbs = []
                 densities = []  
-                if (nerf_name == "zipnerf"):
+                if zp:
                     batch_coords = batch_coords.unsqueeze(0).to(device)             # [1, batch_size, 3]
                     batch_coords = torch.permute(batch_coords, (1, 0, 2))           # [batch_size, 1, 3]
                     batch_std = torch.full_like(batch_coords[..., 0], 0.0)[:, None] # [batch_size, 1, 1]
@@ -610,30 +712,22 @@ def query_nerf_model(nerf_name, model, pipeline, json_path, output_path, dataset
                     viewdir = v.to(model.device) # [3]
                     
                     with torch.no_grad():
-                        if (nerf_name == "zipnerf"):
-                            field_outputs = model.zipnerf.nerf_mlp(rand=False, means=batch_coords, 
-                                                                    stds=batch_std, viewdirs=viewdir)
-                            rgb = field_outputs['rgb']
-                            density = field_outputs['density'].unsqueeze(1)
+                        if zp:
+                            field_outs = model.zipnerf.nerf_mlp(rand=False, means=batch_coords,  
+                                                                stds=batch_std, viewdirs=viewdir)
+                            rgb = field_outs['rgb']
+                            density = field_outs['density'].unsqueeze(1)
                         else:
                             dir = viewdir.expand(batch_size, -1)  # [3] -> [batch_size, 3]
-                            if (nerf_name == "pynerf"):
-                                pixel_area = torch.zeros((16384, 1))
-                                #pixel_area = cams[0].generate_rays(torch.arange(len(cameras)).unsqueeze(-1), coords=coords).pixel_area
-                                f = Frustums(ori, dir, start, end, pixel_area)
-                            else:
-                                f = Frustums(ori, dir, start, end, None)
+                            pixel_area = compute_pixel_area(dir, nerf_name)
+                            f = Frustums(ori, dir, start, end, pixel_area)
                             cam_indices = torch.zeros((batch_size, 1), dtype=torch.int)
                             rays = RaySamples(f, cam_indices).to(model.device)
-                            if (nerf_name == "tensorf"):
-                                field_outputs = model.field.forward(rays, nerf_rgbd=True)
-                            else:
-                                field_outputs = model.field.forward(rays)
-                            rgb = field_outputs[FieldHeadNames.RGB]
-                            density = field_outputs[FieldHeadNames.DENSITY]
+                            field_outs = model.field.forward(rays, nerf_rgbd=True) if trf else model.field.forward(rays)
+                            rgb = field_outs[FieldHeadNames.RGB]
+                            density = field_outs[FieldHeadNames.DENSITY]
 
-                        if (nerf_name == "tensorf"):
-                            density = density.unsqueeze(1) 
+                        density = density.unsqueeze(1) if trf else density
 
                         rgbs.append(rgb.cpu())
                         densities.append(density.cpu())
@@ -776,6 +870,8 @@ class ExportPointCloud(Exporter):
             pcd.points = o3d.utility.Vector3dVector(points)
 
         torch.cuda.empty_cache()
+
+        import open3d as o3d
 
         CONSOLE.print(f"[bold green]:white_check_mark: Generated {pcd}")
         CONSOLE.print("Saving Point Cloud...")
@@ -963,6 +1059,7 @@ class ExportPoissonMesh(Exporter):
         print("\033[A\033[A")
         CONSOLE.print("[bold green]:white_check_mark: Computing Mesh")
 
+        import open3d as o3d
         CONSOLE.print("Saving Mesh...")
         o3d.io.write_triangle_mesh(str(self.output_dir / "poisson_mesh.ply"), mesh)
         print("\033[A\033[A")
@@ -1232,11 +1329,11 @@ class ExportNeRFRGBDensity(Exporter):
     
     Note: Only queries points within the specified scene bounding box.
     """
-    nerf_model: Literal["nerfacto", "zipnerf", "tensorf", "splatfacto", "pynerf"] = "nerfacto"
-    """Name of NeRF model utilized"""
+    nerf_model: Literal["nerfacto", "zipnerf", "tensorf", "splatfacto", "depth-nerfacto", "pynerf"] = "nerfacto"
+    """Name of NeRF model"""
     scene_name: str = "ai_001_001"
     """Name of the pre-trained scene"""
-    dataset_type: Literal["hypersim"] = "hypersim"
+    dataset_type: Literal["hypersim", "scannet"] = "hypersim"
     """Name of the dataset which will be used. TODO: Update for future datasets."""
     dataset_path: str = "hypersim"
     """The path to the scenes in instant-ngp data format."""
@@ -1268,20 +1365,25 @@ class ExportNeRFRGBDensity(Exporter):
             self.output_dir.mkdir(parents=True)
             
         conf, pipeline, ckpt_path, _ = eval_setup(self.load_config)
-
         self.scene_name =  os.path.basename(conf.pipeline.datamanager.data)
-        if (self.scene_name == "train"):
-            # When instant-ngp dataset is used:
+
+        if (self.dataset_type == "hypersim") and (self.scene_name == "train"):
             p = os.path.normpath(conf.pipeline.datamanager.data)
             self.scene_name = p.split(os.sep)[-2]
+            scene_dir = os.path.join(self.dataset_path, self.scene_name, 'train')
+            self.transforms_filename = "transforms.json"
 
-        scene_dir = os.path.join(self.dataset_path, self.scene_name, 'train')
-        if 'transforms.json' not in os.listdir(scene_dir):
-            CONSOLE.print(f"[bold yellow]transforms.json not found for {self.scene_name}. Exiting.")
-            sys.exit(1)
-            
+        elif (self.dataset_type == "scannet"):
+            scene_dir = os.path.join(self.dataset_path, self.scene_name)
+            # self.transforms_filename = "obj_instances.json"
+            self.transforms_filename = "bboxes.json"
+        
         json_path = os.path.join(scene_dir, self.transforms_filename)
         out_path = os.path.join(self.output_dir, f'{self.scene_name}.npz')
+
+        if not os.path.exists(json_path):
+            CONSOLE.print(f"[bold yellow]{self.transforms_filename} not found in {self.scene_name}. Exiting.")
+            sys.exit(1)
 
         if (self.nerf_model == "nerfacto"):
             assert isinstance(pipeline.model, NerfactoModel)
@@ -1298,9 +1400,10 @@ class ExportNeRFRGBDensity(Exporter):
             assert isinstance(pipeline.model, SplatfactoModel)
             model: SplatfactoModel = pipeline.model
             # TODO: Implement Splatfacto
-        elif (self.nerf_model == "pynerf") :
-            from pynerf.models.pynerf_model import PyNeRFModel
-            sys.path.append(r"C:\Users\OEM\nerf-gs-detect\nerfstudio\pynerf") 
+        elif (self.nerf_model == "depth-nerfacto"):
+            assert isinstance(pipeline.model, DepthNerfactoModel)
+            model: DepthNerfactoModel = pipeline.model
+        elif (self.nerf_model == "pynerf"):
             assert isinstance(pipeline.model, PyNeRFModel)
             model: PyNeRFModel = pipeline.model
         else:

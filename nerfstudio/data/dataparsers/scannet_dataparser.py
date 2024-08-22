@@ -28,6 +28,9 @@ from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
 
+import json
+import os
+import glob
 
 @dataclass
 class ScanNetDataParserConfig(DataParserConfig):
@@ -68,6 +71,8 @@ class ScanNetDataParserConfig(DataParserConfig):
     """read point cloud colors from .ply files or not """
     ply_file_path: Path = data / (data.name + ".ply")
     """path to the .ply file containing the 3D points"""
+    create_ns_transforms_json: bool = False
+    """If true, a transform.json in nerfstudio dataset format is created and exits"""
 
 
 @dataclass
@@ -186,6 +191,56 @@ class ScanNet(DataParser):
             dataparser_transform=transform_matrix,
             metadata=metadata,
         )
+
+        if (self.config.create_ns_transforms_json):
+            ### Create transform.json in nerfstudio dataset format
+            count = 0
+            frames = []
+            for im_path, d_path in zip(image_filenames, depth_filenames):
+                c2w = (poses[count, :4, :4]).cpu().numpy()
+                new_row = np.array([0.0, 0.0, 0.0, 1.0])
+                c2w = np.vstack([c2w, new_row])
+                count += 1
+                frame = {
+                    "file_path": im_path.as_posix()[38:],
+                    "depth_file_path": d_path.as_posix()[38:],
+                    "transform_matrix": c2w.tolist(),
+                }
+                frames.append(frame)
+
+            f1_x = intrinsics[:, 0, 0].cpu().numpy().tolist()[0]
+            fl_y = intrinsics[:, 1, 1].cpu().numpy().tolist()[0]
+            cx = intrinsics[:, 0, 2].cpu().numpy().tolist()[0]
+            cy = intrinsics[:, 1, 2].cpu().numpy().tolist()[0]
+
+            json_dict = {
+                "fl_x": f1_x, 
+                "fl_y": fl_y, 
+                "cx": cx,
+                "cy": cy,
+                "w": w,
+                "h": h,
+                "k1": 0.0,
+                "k2": 0.0,
+                "p1": 0.0,
+                "p2": 0.0,
+            }
+            json_dict["frames"] = frames
+
+            scene_name = list(str(self.config.data))[-13:]
+            json_file = r"E:\\NeRF_datasets\\scannet\\" + ''.join(scene_name) + r"\\transforms.json"
+            print(f"Created {json_file}")
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(json_dict, f, indent=4)
+
+            scene_dir = r"E:\NeRF_datasets\scannet_nerfstudio" + ''.join(scene_name)
+            model_name_dir = os.path.join(scene_dir, 'nerf_data', 'depth-nerfacto')
+            date_time_folder = glob.glob(os.path.join(model_name_dir, '*'))[-1]
+            print(f"REMOVE manually: {date_time_folder}")
+            #os.remove(date_time_folder)
+            print("Exiting...")
+            exit()
+
         return dataparser_outputs
 
     def _load_3D_points(
