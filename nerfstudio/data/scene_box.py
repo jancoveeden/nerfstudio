@@ -102,8 +102,12 @@ class OrientedBox:
         pts = torch.cat((pts, torch.ones_like(pts[..., :1])), dim=-1)
         pts = torch.matmul(H_world2bbox, pts.T).T[..., :3]
 
-        comp_l = torch.tensor(-S / 2)
-        comp_m = torch.tensor(S / 2)
+        comp_l = S.clone().detach() 
+        comp_l = -comp_l/2
+        comp_m = S.clone().detach() 
+        comp_m = comp_m/2
+        # comp_l = torch.tensor(-S / 2)
+        # comp_m = torch.tensor(S / 2)
         mask = torch.all(torch.concat([pts > comp_l, pts < comp_m], dim=-1), dim=-1)
         return mask
 
