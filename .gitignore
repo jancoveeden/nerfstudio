@@ -192,6 +192,7 @@ camera_paths/
 
 # Models
 zipnerf-pytorch/
+gsplat/
 
 # pixi environments
 .pixi
