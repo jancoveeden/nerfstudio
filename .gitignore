@@ -194,6 +194,10 @@ camera_paths/
 zipnerf-pytorch/
 gsplat/
 
+# Exporter files
+nerfstudio/scripts/exporter.py
+nerfstudio/utils/grid_utils.py
+
 # pixi environments
 .pixi
 /third_party
