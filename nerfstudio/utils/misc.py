@@ -180,9 +180,9 @@ def torch_compile(*args, **kwargs) -> Any:
         # torch.compile is not supported on Windows
         # https://github.com/orgs/pytorch/projects/27
         # TODO: @jkulhanek, remove this once torch.compile is supported on Windows
-        warnings.warn(
-            "Windows does not yet support torch.compile and the performance will be affected.", RuntimeWarning
-        )
+        # warnings.warn(
+        #     "Windows does not yet support torch.compile and the performance will be affected.", RuntimeWarning # Removed for now
+        # )
         if args and isinstance(args[0], torch.nn.Module):
             return args[0]
         else:

@@ -197,6 +197,7 @@ gsplat/
 # Exporter files
 nerfstudio/scripts/exporter.py
 nerfstudio/utils/grid_utils.py
+nerfstudio/nerf_splat_det/
 
 # pixi environments
 .pixi

@@ -44,7 +44,7 @@ def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Pat
     """
     assert config.load_dir is not None
     if config.load_step is None:
-        CONSOLE.print("Loading latest checkpoint from load_dir")
+        # CONSOLE.print("Loading latest checkpoint from load_dir") # Removed for cleaner output
         # NOTE: this is specific to the checkpoint name format
         if not os.path.exists(config.load_dir):
             CONSOLE.rule("Error", style="red")
@@ -61,7 +61,7 @@ def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Pat
     assert load_path.exists(), f"Checkpoint {load_path} does not exist"
     loaded_state = torch.load(load_path, map_location="cpu")
     pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
-    CONSOLE.print(f":white_check_mark: Done loading checkpoint from {load_path}")
+    # CONSOLE.print(f":white_check_mark: Done loading checkpoint from {load_path}") # Removed for cleaner output
     return load_path, load_step
 
 
