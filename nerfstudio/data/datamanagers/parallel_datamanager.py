@@ -124,7 +124,8 @@ class DataProcessor(mp.Process):  # type: ignore
             for idx in indices:
                 res = executor.submit(self.dataset.__getitem__, idx)
                 results.append(res)
-            for res in track(results, description="Loading data batch", transient=False):
+            #for res in track(results, description="Loading data batch", transient=False):
+            for res in results:
                 batch_list.append(res.result())
         self.img_data = self.config.collate_fn(batch_list)
 
@@ -254,12 +255,12 @@ class ParallelDataManager(DataManager, Generic[TDataset]):
         ]
         for proc in self.data_procs:
             proc.start()
-        print("Started threads")
+        #print("Started threads")
 
     def setup_eval(self):
         """Sets up the data loader for evaluation."""
         assert self.eval_dataset is not None
-        CONSOLE.print("Setting up evaluation dataset...")
+        #CONSOLE.print("Setting up evaluation dataset...")
         self.eval_image_dataloader = CacheDataloader(
             self.eval_dataset,
             num_images_to_sample_from=self.config.eval_num_images_to_sample_from,

@@ -299,8 +299,8 @@ class ColmapDataParser(DataParser):
                 mask_filenames.append(Path(frame["mask_path"]))
             if "depth_path" in frame:
                 depth_filenames.append(Path(frame["depth_path"]))
-
-        assert len(mask_filenames) == 0 or (len(mask_filenames) == len(image_filenames)), """
+        
+                assert len(mask_filenames) == 0 or (len(mask_filenames) == len(image_filenames)), """
         Different number of image and mask filenames.
         You should check that mask_path is specified for every frame (or zero frames) in transforms.json.
         """
@@ -530,7 +530,7 @@ class ColmapDataParser(DataParser):
                     df += 1
 
                 self._downscale_factor = 2**df
-                CONSOLE.log(f"Using image downscale factor of {self._downscale_factor}")
+                #CONSOLE.log(f"Using image downscale factor of {self._downscale_factor}")
             else:
                 self._downscale_factor = self.config.downscale_factor
             if self._downscale_factor > 1 and not all(

@@ -77,7 +77,7 @@ class CacheDataloader(DataLoader):
 
         self.cached_collated_batch = None
         if self.cache_all_images:
-            CONSOLE.print(f"Caching all {len(self.dataset)} images.")
+            #CONSOLE.print(f"Caching all {len(self.dataset)} images.")
             if len(self.dataset) > 500:
                 CONSOLE.print(
                     "[bold yellow]Warning: If you run out of memory, try reducing the number of images to sample from."
@@ -113,7 +113,8 @@ class CacheDataloader(DataLoader):
                 res = executor.submit(self.dataset.__getitem__, idx)
                 results.append(res)
 
-            for res in track(results, description="Loading data batch", transient=True):
+            #for res in track(results, description="Loading data batch", transient=True):
+            for res in results:
                 batch_list.append(res.result())
 
         return batch_list

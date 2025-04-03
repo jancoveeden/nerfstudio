@@ -197,7 +197,8 @@ gsplat/
 # Exporter files
 nerfstudio/scripts/exporter.py
 nerfstudio/utils/grid_utils.py
-nerfstudio/nerf_splat_det/
+nerf_splat_detect/
+nerfstudio/svraster/
 
 # pixi environments
 .pixi
