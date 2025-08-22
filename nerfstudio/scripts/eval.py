@@ -40,10 +40,20 @@ class ComputePSNR:
     output_path: Path = Path("output.json")
     # Optional path to save rendered outputs to.
     render_output_path: Optional[Path] = None
+    # Load step to use for evaluation.
+    load_step: int = -1
 
     def main(self) -> None:
         """Main function."""
-        config, pipeline, checkpoint_path, _ = eval_setup(self.load_config)
+
+        def update_load_step(config):
+            if self.load_step > 0:
+                config.load_step = self.load_step
+                CONSOLE.print(f"[bold green]Setting load_step to {self.load_step}")
+            return config
+        callb = update_load_step if self.load_step > 0 else None
+        config, pipeline, checkpoint_path, _ = eval_setup(self.load_config, update_config_callback=callb)
+        
         assert self.output_path.suffix == ".json"
         if self.render_output_path is not None:
             self.render_output_path.mkdir(parents=True, exist_ok=True)
